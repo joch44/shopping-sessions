@@ -31,6 +31,24 @@ Competition VM: TODO lscpu NUMA/L3, disk speed (fio), THP, I/O floors.
 - Env: `DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch HOME=/scratch NCPU=8 MEM_GB=24`.
 - Scoring: exact match, then fastest.
 
+## Contest (from the starter kits in `inputs/`, unpacked in `vendor/`)
+
+- Submit a public GitHub repo (optionally a commit SHA). Grader builds the Dockerfile natively
+  (linux/amd64). **Build time is never timed; only the run is.** `CMD` runs with no args; exit 0 = done.
+- Scorer flags (starter `scripts/docker_run.sh`): `--network none --read-only --tmpfs /tmp:rw,size=64m,mode=1777
+  --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096 --cpus 8 --memory 24g --memory-swap 24g
+  --user 1000:1000`, `/data:ro`, `/output`, `/scratch`.
+- 36 hand-written fixtures (A1-A12, E1-E20, L1-L4), identical in all three starters, expected
+  rows "written by hand from the rules, not produced by the reference".
+- `dev-answer`: expected tables for `--seed 1 --events 1000000 --clicks 250000`
+  (117,038 user_daily rows, 27,400 campaign_daily rows).
+- Official comparator `compare.py`: order-insensitive exact match; any integer width; string or
+  categorical; `day` must be Date; exact column set; flags duplicate keys.
+- **Fixture L3 trap:** only the FIRST line of a file is the header. A later `user_id_a,user_id_b`
+  line is data and links IDs named `user_id_a`/`user_id_b`. IDs can contain a TAB (`A\tB`), which
+  sorts before lowercase and becomes the person's name.
+- Organizers confirm DuckDB/Polars CSV readers do not follow `rules.md`.
+
 ## Contest (unknown; ask)
 
 - Graded `--events` / `--clicks`. Best guess: ~60M events + 15M clicks (generator comment:
