@@ -32,6 +32,46 @@ struct Dict {
     indices: Vec<u32>,
 }
 
+/// Dictionary of a string column whose equal values come in runs (user_daily: a person's rows
+/// are consecutive): one entry per run, no hashing. A value repeated in a later, separate run
+/// gets a second (duplicate) entry, which readers decode to the same value.
+fn dict_runs(bytes: &[u8], ends: &[u32]) -> Dict {
+    let (mut plain, mut indices) = (Vec::new(), Vec::with_capacity(ends.len()));
+    let (mut count, mut s, mut prev): (usize, usize, Option<&[u8]>) = (0, 0, None);
+    for &e in ends {
+        let v = &bytes[s..e as usize];
+        s = e as usize;
+        if prev != Some(v) {
+            plain.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            plain.extend_from_slice(v);
+            count += 1;
+            prev = Some(v);
+        }
+        indices.push(count as u32 - 1);
+    }
+    Dict { plain, count, indices }
+}
+
+/// Dictionary of an integer column with a small value range: a direct table instead of a map.
+fn dict_small<T: Copy + Into<i64>>(values: &[T], le: impl Fn(T, &mut Vec<u8>)) -> Option<Dict> {
+    let (lo, hi) = values.iter().fold((i64::MAX, i64::MIN), |(lo, hi), &v| (lo.min(v.into()), hi.max(v.into())));
+    if values.is_empty() || hi - lo >= 1 << 16 {
+        return None;
+    }
+    let mut slot = vec![u32::MAX; (hi - lo + 1) as usize];
+    let (mut plain, mut indices, mut count) = (Vec::new(), Vec::with_capacity(values.len()), 0u32);
+    for &v in values {
+        let at = &mut slot[(v.into() - lo) as usize];
+        if *at == u32::MAX {
+            *at = count;
+            count += 1;
+            le(v, &mut plain);
+        }
+        indices.push(*at);
+    }
+    Some(Dict { plain, count: count as usize, indices })
+}
+
 fn dict_strings(bytes: &[u8], ends: &[u32]) -> Dict {
     let mut map: rustc_hash::FxHashMap<&[u8], u32> = rustc_hash::FxHashMap::default();
     let (mut plain, mut indices) = (Vec::new(), Vec::with_capacity(ends.len()));
@@ -241,9 +281,10 @@ pub fn write(path: &std::path::Path, schema_name: &str, names: &[&str], cols: &[
     for (name, col) in names.iter().zip(cols) {
         page.clear();
         let dict = match col {
-            Col::StrDict { bytes, ends } | Col::OptStrDict { bytes, ends, .. } => Some((BYTE_ARRAY, dict_strings(bytes, ends))),
-            Col::DateDict(v) => Some((INT32, dict_ints(v, |x, out| out.extend_from_slice(&x.to_le_bytes())))),
-            Col::I64Dict(v) => Some((INT64, dict_ints(v, |x, out| out.extend_from_slice(&x.to_le_bytes())))),
+            Col::StrDict { bytes, ends } => Some((BYTE_ARRAY, dict_runs(bytes, ends))),
+            Col::OptStrDict { bytes, ends, .. } => Some((BYTE_ARRAY, dict_strings(bytes, ends))),
+            Col::DateDict(v) => Some((INT32, dict_small(v, |x, out| out.extend_from_slice(&x.to_le_bytes())).unwrap_or_else(|| dict_ints(v, |x, out| out.extend_from_slice(&x.to_le_bytes()))))),
+            Col::I64Dict(v) => Some((INT64, dict_small(v, |x, out| out.extend_from_slice(&x.to_le_bytes())).unwrap_or_else(|| dict_ints(v, |x, out| out.extend_from_slice(&x.to_le_bytes()))))),
             _ => None,
         };
         if let Some((ty, d)) = dict {
