@@ -53,7 +53,11 @@ Mirror VM: 3.01 s @20M, 8.81 s @60M. All outputs match.
 | v12 | THP threshold 16 MiB (research session) | ~2.21 | 6.40 | ~= v9 at 20M in interleaved A/B |
 | v13 | tagged person table (research R5) | | | |
 | v14 | per-thread scatter arenas (research R3, one region per partition) | 2.02 | 5.61 | interleaved vs v9: 2.16 / 6.56 |
-| v15 | dedup table (hash32, index), sequential winner emit | PENDING | | dedup 0.166 -> 0.128 s (analysis) |
+| v15 | dedup table (hash32, index), sequential winner emit | 1.92 | 5.35 | interleaved vs v14: 1.96 / 5.53 |
+| v17 | click person lookups batched (32) with prefetch | | | clicks 0.18 -> 0.13 s (mirror stage) |
+| v18 | hand-written Parquet writer (research Topic E), crate fallback > 1 GiB | 1.93 | 5.10 | clean interleaved vs v15: 2.00 / 5.41 |
+| v19 | dense campaign counters + 1024 person partitions (research, mirror-measured) | 1.78 | 4.97 | interleaved vs v18: 1.82 / 5.12 |
+| v20 | 16-byte per-person session events, 32-byte clicks | PENDING | | sessions 0.145 -> 0.130 s (analysis) |
 
 Calibration: v9 mirror 2.24 s vs grader 1.97 s -> factor 0.878 (tools/to_board.py). Target <1.0 s grader
 ~= 1.1 s mirror. Container start/stop floor ~0.34 s (research): in-process budget ~0.75 s @20M.
@@ -61,5 +65,8 @@ Calibration: v9 mirror 2.24 s vs grader 1.97 s -> factor 0.878 (tools/to_board.p
 Lessons: analysis-VM (Zen 5, 16 cores) gains roughly halve on the mirror (Ice Lake, 4 cores x 2 HT);
 memory-layout changes must be A/B'd on the mirror, interleaved (run-to-run drift is ~2-4%).
 
-Rejected: GLIBC_TUNABLES hugetlb (88 MB of 4.4 GB got huge pages); THP threshold 1 MiB (v8);
+Rejected (measured): v16 one pool for clicks + dedup (no change); 2048/4096 dedup partitions
+(dedup -0.01 s but parse +0.03..0.06 s: more scatter targets); research Topic A one-scatter +
+retractions (correct, slower); radix sort for sessions (research: no gain over counting sort).
+Rejected earlier: GLIBC_TUNABLES hugetlb (88 MB of 4.4 GB got huge pages); THP threshold 1 MiB (v8);
 shared global dedup table (feasibility, 1.7x slower); software write-combining (no gain on Ice Lake, research).
