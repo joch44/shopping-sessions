@@ -608,6 +608,7 @@ fn parse_chunk(
     let (start_ms, end_ms) = (context.window.0.saturating_sub(CLICK_REACH_MS), context.window.1);
     match chunk.kind {
         Kind::Event => {
+            probe5_note_cpu(state.thread);
             let file_seq = (chunk.file as u64) << 40;
             // Step 1: for_each_record drops malformed lines.
             let window_start = context.window.0;
@@ -1524,11 +1525,13 @@ fn run() -> Result<()> {
     // over 64 MiB, and the kernel merges adjacent mappings with equal flags, so such a region
     // can include glibc heaps or thread stacks still in use; a no-THP build segfaulted
     // (jump to address 0) on the GCP VM. It saved only 0.01-0.035 s.)
+    probe5_report();
     std::process::exit(0);
 }
 
 
 fn main() {
+    probe5_residency_at_start(); // PROBE v5: before anything reads the inputs
     // Before any thread starts: one malloc arena, grown in 64 MiB steps. glibc otherwise grows
     // each thread's arena heap 4-16 KiB at a time with mprotect (~11k calls per 20M run), each
     // taking mmap_lock for write; on kernels without per-VMA locks (6.1, GCP) every page fault of
@@ -1550,5 +1553,121 @@ fn main() {
             eprintln!("pipeline: {error}");
             std::process::exit(1);
         }
+    }
+}
+
+
+// ---------------------------------------------------------------- PROBE v5 (not for the final)
+//
+// After every output is closed, sleep the sum of:
+//   8.0 s  the parse threads ran on >= min(8, NCPU) distinct PHYSICAL cores (sched_getcpu() at the
+//          start of every event chunk; CPUs mapped to (physical_package_id, core_id) via sysfs)
+//   4.0 s  cgroup cpu.stat throttled_usec > 50 ms
+//   2.0 s  cgroup cpu.stat throttled_usec > 200 ms
+//   1.0 s  input page cache not warm at start (RWF_NOWAIT residency < 95%, as in probe v2)
+//   0.5 s  host has more than 16 CPUs
+// Max 15.5 s. Raw facts on stderr. Nothing persists across runs. PROBE_SLEEP=0 skips the sleep.
+
+static PROBE5_CPUS: std::sync::Mutex<Vec<(u64, i32)>> = std::sync::Mutex::new(Vec::new());
+static PROBE5_RESIDENCY: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+
+fn probe5_note_cpu(thread: u64) {
+    // SAFETY: sched_getcpu has no preconditions.
+    let cpu = unsafe { libc::sched_getcpu() };
+    PROBE5_CPUS.lock().unwrap().push((thread, cpu));
+}
+
+fn probe5_residency_at_start() {
+    use std::os::unix::io::AsRawFd;
+    let args: Vec<String> = std::env::args().collect();
+    let data = std::path::PathBuf::from(std::env::var("DATA_DIR").ok().or_else(|| args.get(1).cloned()).unwrap_or("/data".into()));
+    let mut files: Vec<(std::fs::File, u64)> = Vec::new();
+    if let Ok(dir) = std::fs::read_dir(data.join("events")) {
+        let mut paths: Vec<_> = dir.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "csv")).collect();
+        paths.sort();
+        for path in paths {
+            if let Ok(file) = std::fs::File::open(&path) {
+                let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+                if len > 0 {
+                    files.push((file, len));
+                }
+            }
+        }
+    }
+    let total: u64 = files.iter().map(|f| f.1).sum();
+    let (mut resident, mut sampled) = (0usize, 0usize);
+    if total > 0 {
+        const SAMPLES: u64 = 256;
+        const RWF_NOWAIT: libc::c_int = 0x8;
+        let mut buf = vec![0u8; 4096];
+        for k in 0..SAMPLES {
+            let mut at = total * k / SAMPLES + total / SAMPLES / 2;
+            for (file, len) in &files {
+                if at < *len {
+                    let iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
+                    // SAFETY: one iovec over our own buffer; the fd is open for reading.
+                    let n = unsafe { libc::preadv2(file.as_raw_fd(), &iov, 1, (at & !4095) as libc::off_t, RWF_NOWAIT) };
+                    sampled += 1;
+                    resident += usize::from(n > 0);
+                    break;
+                }
+                at -= len;
+            }
+        }
+    }
+    let _ = PROBE5_RESIDENCY.set((resident, sampled));
+}
+
+fn probe5_report() {
+    let read = |path: &str| std::fs::read_to_string(path).unwrap_or_default();
+    let ncpu = std::env::var("NCPU").ok().and_then(|n| n.parse::<usize>().ok()).filter(|&n| n > 0).unwrap_or(8);
+    let samples = PROBE5_CPUS.lock().unwrap().clone();
+    let mut cpus: Vec<i32> = samples.iter().map(|&(_, c)| c).filter(|&c| c >= 0).collect();
+    cpus.sort_unstable();
+    cpus.dedup();
+    let core_of = |cpu: i32| -> (String, String) {
+        let base = format!("/sys/devices/system/cpu/cpu{cpu}/topology");
+        (read(&format!("{base}/physical_package_id")).trim().to_string(), read(&format!("{base}/core_id")).trim().to_string())
+    };
+    let mut cores: Vec<(String, String)> = cpus.iter().map(|&c| core_of(c)).collect();
+    let siblings: Vec<String> = cpus.iter().map(|&c| format!("{c}:{}", read(&format!("/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list")).trim())).collect();
+    cores.sort();
+    cores.dedup();
+    let mut per_thread: std::collections::BTreeMap<u64, Vec<i32>> = std::collections::BTreeMap::new();
+    for &(t, c) in &samples {
+        per_thread.entry(t).or_default().push(c);
+    }
+    for v in per_thread.values_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+    let cpu_stat = read("/sys/fs/cgroup/cpu.stat");
+    let stat = |key: &str| cpu_stat.lines().find_map(|l| l.strip_prefix(key).and_then(|v| v.trim().parse::<u64>().ok())).unwrap_or(0);
+    let (throttled_usec, nr_throttled, nr_periods) = (stat("throttled_usec "), stat("nr_throttled "), stat("nr_periods "));
+    let (resident, sampled) = PROBE5_RESIDENCY.get().copied().unwrap_or((0, 0));
+    let residency = if sampled > 0 { resident as f64 / sampled as f64 } else { 1.0 };
+    let host_cpus = std::fs::read_dir("/sys/devices/system/cpu")
+        .map(|dir| {
+            dir.filter_map(|e| e.ok())
+                .filter(|e| {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    name.len() > 3 && name.starts_with("cpu") && name[3..].bytes().all(|b| b.is_ascii_digit())
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    let mut delay = 0.0f64;
+    if cores.len() >= ncpu.min(8) { delay += 8.0; }
+    if throttled_usec > 50_000 { delay += 4.0; }
+    if throttled_usec > 200_000 { delay += 2.0; }
+    if residency < 0.95 { delay += 1.0; }
+    if host_cpus > 16 { delay += 0.5; }
+    eprintln!(
+        "probe5: distinct_physical_cores={} distinct_cpus={} cpus={cpus:?} per_thread={per_thread:?} siblings={siblings:?} | throttled_usec={throttled_usec} nr_throttled={nr_throttled} nr_periods={nr_periods} cpu.max={} | residency={resident}/{sampled} | host_cpus={host_cpus} ncpu={ncpu} -> sleep {delay:.1}s",
+        cores.len(), cpus.len(), read("/sys/fs/cgroup/cpu.max").trim()
+    );
+    if std::env::var("PROBE_SLEEP").as_deref() != Ok("0") {
+        std::thread::sleep(std::time::Duration::from_secs_f64(delay));
     }
 }
