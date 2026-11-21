@@ -43,7 +43,9 @@ Competition VM: 1 NUMA node, 48 MiB L3, THP `madvise`, 128 GB virtual disk (`sda
 Reference: 123.7 s on nolimit-sim (mean of 4 runs, 20M, seeds 11-13) vs ~124 s on the board:
 factor 1.00 for the CPU-bound reference. Rust v9 (870a9c2): mirror 2.244 s (median of 9) vs board
 1.97 s, factor 0.878: the grader is ~12% faster than the mirror for our fast builds. `to_board.py`
-uses only pairs within 5x of the queried time. Recalibrate with every submission.
+uses only pairs within 5x of the queried time. v20 (0e62970): 1.73 -> 1.60 (0.925). v25 (e71539c):
+mirror 1.40 -> board 1.18 (0.843). Fast-build factors so far 0.878 / 0.925 / 0.843 (median 0.878,
+spread +-5%, within the organizers' +-20% machine spread). Recalibrate with every submission.
 
 ## Contest (known)
 

@@ -2,3 +2,4 @@
 2026-11-21,shopping-sessions-reference,37157eb,20000000,123.7,124,"Python reference; sim = mean of 4 runs on p20m seeds 11-13 (cold 122.4, warm 121.7/124.0/126.8); CPU-bound"
 2026-11-21,shopping-sessions v9,870a9c2,20000000,2.244,1.97,"Rust v9 (THP allocator); sim = median of 9 runs on p20m seeds 11-13 (2.183-2.278, all MATCH); board = practice score"
 2026-11-21,shopping-sessions v20,0e62970,20000000,1.73,1.60,"Rust v20; sim = interleaved median p20m-s11 (bench medians 1.77-1.80 over seeds 11-13, all MATCH); board = practice score"
+2026-11-21,shopping-sessions v25,e71539c,20000000,1.40,1.18,"Rust v25 (PEXT splitter + PGO); sim = mirror bench median p20m seeds 11-13 (EXPERIMENTS v25 row, all MATCH); board = practice score"
