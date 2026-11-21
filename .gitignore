@@ -3,3 +3,4 @@ bin/
 target/
 *.parquet
 .venv/
+tests/corpus/cases/
