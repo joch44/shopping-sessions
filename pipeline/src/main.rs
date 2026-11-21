@@ -133,7 +133,6 @@ fn bytes_of(map: &Option<Mmap>) -> &[u8] {
 enum Kind {
     Event,
     Click,
-    Link,
 }
 
 /// A byte range of one file. A line belongs to the chunk holding its first byte.
@@ -207,20 +206,20 @@ fn load_window(data: &Path) -> Result<(i64, i64)> {
 // ---------------------------------------------------------------- people (rules.md "Linked IDs")
 
 /// ID key -> key of its person's name (the byte-wise smallest ID). IDs absent are their own person.
-fn resolve_people(maps: &[Option<Mmap>], threads: usize, longs: &LongIds) -> FxHashMap<Key, Key> {
-    let mut chunks = Vec::new();
-    chunks_of(Kind::Link, maps, &mut chunks);
-    let pairs = run_tasks(threads, chunks.len(), Vec::new, |pairs: &mut Vec<(Key, Key)>, at| {
-        let chunk = chunks[at];
+/// Runs on one thread while the others parse events (links are ~1% of the input).
+fn resolve_people(maps: &[Option<Mmap>], longs: &LongIds) -> FxHashMap<Key, Key> {
+    let mut pairs: Vec<(Key, Key)> = Vec::new();
+    for map in maps {
+        let data = bytes_of(map);
         let mut fields = [None; 2];
-        for_each_line(bytes_of(&maps[chunk.file]), chunk.start, chunk.end, |line, _| {
+        for_each_line(data, 0, data.len(), |line, _| {
             if parse_line(line, &mut fields) {
                 if let (Some(a), Some(b)) = (fields[0], fields[1]) {
                     pairs.push((key_of(a, Some(longs)), key_of(b, Some(longs))));
                 }
             }
         });
-    });
+    }
 
     let mut index: FxHashMap<Key, u32> = FxHashMap::default();
     let mut keys: Vec<Key> = Vec::new();
@@ -234,7 +233,7 @@ fn resolve_people(maps: &[Option<Mmap>], threads: usize, longs: &LongIds) -> FxH
         }
         node
     }
-    for (a, b) in pairs.into_iter().flatten() {
+    for (a, b) in pairs {
         let mut intern = |k: Key| {
             *index.entry(k).or_insert_with(|| {
                 keys.push(k);
@@ -274,7 +273,7 @@ fn resolve_people(maps: &[Option<Mmap>], threads: usize, longs: &LongIds) -> FxH
 #[derive(Clone, Copy)]
 struct EventCopy {
     id: Key,
-    person: Key,
+    user: Key, // the copy's user_id; its person is resolved after links, in dedup
     seq: u64, // file and byte offset: the reference keeps the first copy seen on an ingest tie
     ingest: i64,
     ts: i64,
@@ -304,19 +303,15 @@ struct Context {
     products: FxHashMap<Key, u32>,
     unknown_category: u32,
     campaigns: FxHashMap<Key, u32>,
-    people: FxHashMap<Key, Key>,
     longs: LongIds,
 }
 
-impl Context {
-    #[inline]
-    fn person(&self, user: &[u8]) -> Key {
-        let id = key_of(user, Some(&self.longs));
-        *self.people.get(&id).unwrap_or(&id)
-    }
+#[inline]
+fn person_of(people: &FxHashMap<Key, Key>, user: Key) -> Key {
+    *people.get(&user).unwrap_or(&user)
 }
 
-/// Events steps 3 (validate) and 4 (late) for one copy: Some((person, ts, price, category)).
+/// Events steps 3 (validate) and 4 (late) for one copy: Some((user key, ts, price, category)).
 #[inline]
 fn judge(context: &Context, fields: &[Option<&[u8]>; 7], ingest: i64) -> Option<(Key, i64, u32, u32)> {
     let [_, user, ts, _, kind, product, price] = *fields;
@@ -347,7 +342,7 @@ fn judge(context: &Context, fields: &[Option<&[u8]>; 7], ingest: i64) -> Option<
         return None;
     }
     let category = *context.products.get(&key_of(product, None)).unwrap_or(&context.unknown_category);
-    Some((context.person(user), ts, price, category))
+    Some((key_of(user, Some(&context.longs)), ts, price, category))
 }
 
 #[inline]
@@ -360,7 +355,14 @@ struct ParseState {
     clicks: Vec<Vec<Click>>,     // by person partition
 }
 
-fn parse_chunk(context: &Context, event_maps: &[Option<Mmap>], click_maps: &[Option<Mmap>], chunk: Chunk, state: &mut ParseState) {
+fn parse_chunk(
+    context: &Context,
+    people: Option<&FxHashMap<Key, Key>>,
+    event_maps: &[Option<Mmap>],
+    click_maps: &[Option<Mmap>],
+    chunk: Chunk,
+    state: &mut ParseState,
+) {
     let (start_ms, end_ms) = (context.window.0.saturating_sub(CLICK_REACH_MS), context.window.1);
     match chunk.kind {
         Kind::Event => {
@@ -375,8 +377,8 @@ fn parse_chunk(context: &Context, event_maps: &[Option<Mmap>], click_maps: &[Opt
                 let ingest = fields[3].and_then(ts::parse).unwrap_or(NEVER);
                 let seq = file_seq | offset as u64;
                 let copy = match judge(context, &fields, ingest) {
-                    Some((person, ts, price, category)) => EventCopy { id, person, seq, ingest, ts, price, category, valid: true },
-                    None => EventCopy { id, person: 0, seq, ingest, ts: 0, price: 0, category: 0, valid: false },
+                    Some((user, ts, price, category)) => EventCopy { id, user, seq, ingest, ts, price, category, valid: true },
+                    None => EventCopy { id, user: 0, seq, ingest, ts: 0, price: 0, category: 0, valid: false },
                 };
                 state.events[partition(id)].push(copy);
             });
@@ -396,27 +398,50 @@ fn parse_chunk(context: &Context, event_maps: &[Option<Mmap>], click_maps: &[Opt
                 if ts < start_ms || ts >= end_ms {
                     return;
                 }
-                let person = context.person(user);
+                let people = people.expect("clicks are parsed after links");
+                let person = person_of(people, key_of(user, Some(&context.longs)));
                 let click = Click { person, click_id: key_of(click_id, Some(&context.longs)), ts, campaign };
                 state.clicks[partition(person)].push(click);
             });
         }
-        Kind::Link => unreachable!(),
     }
 }
 
 /// Events step 2 for one event_id partition: per id, the copy with the smallest
 /// (ingest_ts, file position) is kept; if it is valid it survives.
-fn dedup(mut copies: Vec<EventCopy>, out: &mut [Vec<Event>]) {
-    copies.sort_unstable_by_key(|c| (c.id, c.ingest, c.seq));
-    let mut previous: Option<Key> = None;
-    for copy in &copies {
-        if previous == Some(copy.id) {
+fn dedup(copies: Vec<EventCopy>, people: &FxHashMap<Key, Key>, table: &mut Vec<u32>, out: &mut [Vec<Event>]) {
+    // Open addressing over indexes into `copies`; u32::MAX is empty. Within one partition
+    // the low hash bits are all equal, so the table uses the high bits.
+    let slots = (copies.len() * 2).next_power_of_two().max(16);
+    table.clear();
+    table.resize(slots, u32::MAX);
+    let mask = slots - 1;
+    for (index, copy) in copies.iter().enumerate() {
+        let mut slot = (mix(copy.id) >> 32) as usize & mask;
+        loop {
+            let held = table[slot];
+            if held == u32::MAX {
+                table[slot] = index as u32;
+                break;
+            }
+            let other = &copies[held as usize];
+            if other.id == copy.id {
+                if (copy.ingest, copy.seq) < (other.ingest, other.seq) {
+                    table[slot] = index as u32;
+                }
+                break;
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+    for &held in table.iter() {
+        if held == u32::MAX {
             continue;
         }
-        previous = Some(copy.id);
+        let copy = &copies[held as usize];
         if copy.valid {
-            out[partition(copy.person)].push(Event { person: copy.person, ts: copy.ts, price: copy.price, category: copy.category });
+            let person = person_of(people, copy.user);
+            out[partition(person)].push(Event { person, ts: copy.ts, price: copy.price, category: copy.category });
         }
     }
 }
@@ -612,37 +637,45 @@ fn run() -> Result<()> {
     let link_maps = map_folder(&data.join("links"))?;
     timer.mark("lookups + mmap");
 
-    let longs = LongIds::default();
-    let people = resolve_people(&link_maps, threads, &longs);
-    timer.mark("links");
-    let context = Context { window, products, unknown_category, campaigns, people, longs };
+    let context = Context { window, products, unknown_category, campaigns, longs: LongIds::default() };
 
-    // B. parse events and clicks, largest chunks first.
-    let mut chunks = Vec::new();
-    chunks_of(Kind::Event, &event_maps, &mut chunks);
-    chunks_of(Kind::Click, &click_maps, &mut chunks);
-    chunks.sort_by_key(|chunk| std::cmp::Reverse(chunk.end - chunk.start));
-    let parsed = run_tasks(
-        threads,
-        chunks.len(),
-        || ParseState {
-            events: (0..PARTITIONS).map(|_| Vec::new()).collect(),
-            clicks: (0..PARTITIONS).map(|_| Vec::new()).collect(),
-        },
-        |state, at| parse_chunk(&context, &event_maps, &click_maps, chunks[at], state),
-    );
-    let (event_parts, click_parts): (Vec<_>, Vec<_>) = parsed.into_iter().map(|s| (s.events, s.clicks)).unzip();
-    let event_parts = transpose(event_parts);
-    let click_parts = transpose(click_parts);
-    timer.mark("parse events + clicks");
+    // A+B. Task 0 resolves links on one thread while the other threads parse events
+    // (largest chunks first); clicks need people, so they are parsed after.
+    let mut event_chunks = Vec::new();
+    chunks_of(Kind::Event, &event_maps, &mut event_chunks);
+    event_chunks.sort_by_key(|chunk| std::cmp::Reverse(chunk.end - chunk.start));
+    let people_slot: Mutex<Option<FxHashMap<Key, Key>>> = Mutex::new(None);
+    let new_state = || ParseState {
+        events: (0..PARTITIONS).map(|_| Vec::new()).collect(),
+        clicks: (0..PARTITIONS).map(|_| Vec::new()).collect(),
+    };
+    let parsed = run_tasks(threads, event_chunks.len() + 1, new_state, |state, at| {
+        if at == 0 {
+            *people_slot.lock().unwrap() = Some(resolve_people(&link_maps, &context.longs));
+        } else {
+            parse_chunk(&context, None, &event_maps, &click_maps, event_chunks[at - 1], state);
+        }
+    });
+    let people = people_slot.into_inner().unwrap().expect("links resolved");
+    timer.mark("links || parse events");
+    let mut click_chunks = Vec::new();
+    chunks_of(Kind::Click, &click_maps, &mut click_chunks);
+    click_chunks.sort_by_key(|chunk| std::cmp::Reverse(chunk.end - chunk.start));
+    let clicked = run_tasks(threads, click_chunks.len(), new_state, |state, at| {
+        parse_chunk(&context, Some(&people), &event_maps, &click_maps, click_chunks[at], state)
+    });
+    let event_parts = transpose(parsed.into_iter().map(|s| s.events).collect());
+    let click_parts = transpose(clicked.into_iter().map(|s| s.clicks).collect());
+    timer.mark("parse clicks");
 
     // C. dedup per event_id partition.
     let deduped = run_tasks(
         threads,
         PARTITIONS,
-        || (0..PARTITIONS).map(|_| Vec::new()).collect::<Vec<Vec<Event>>>(),
-        |out, p| dedup(take_all(&event_parts[p]), out),
+        || (Vec::new(), (0..PARTITIONS).map(|_| Vec::new()).collect::<Vec<Vec<Event>>>()),
+        |(table, out), p| dedup(take_all(&event_parts[p]), &people, table, out),
     );
+    let deduped: Vec<Vec<Vec<Event>>> = deduped.into_iter().map(|(_, out)| out).collect();
     let person_events = transpose(deduped);
     timer.mark("dedup");
 
@@ -717,8 +750,12 @@ fn run() -> Result<()> {
 }
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("pipeline: {error}");
-        std::process::exit(1);
+    match run() {
+        // Outputs are written and closed: exit at once instead of freeing gigabytes.
+        Ok(()) => std::process::exit(0),
+        Err(error) => {
+            eprintln!("pipeline: {error}");
+            std::process::exit(1);
+        }
     }
 }

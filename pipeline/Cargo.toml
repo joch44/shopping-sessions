@@ -19,3 +19,8 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = false
+
+# Same code generation as release, with symbols, for perf.
+[profile.profiling]
+inherits = "release"
+debug = true
