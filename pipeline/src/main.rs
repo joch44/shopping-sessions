@@ -336,7 +336,13 @@ fn judge(context: &Context, fields: &[Option<&[u8]>; 7], ingest: i64) -> Option<
     if ingest == NEVER || i128::from(ingest) - i128::from(ts) > LATE_MS {
         return None;
     }
-    let category = *context.products.get(&key_of(product, None)).unwrap_or(&context.unknown_category);
+    // Categories only matter for purchases (top_category sums purchase prices); views and
+    // carts only need a non-empty product_id, checked above. Skip ~97% of the lookups.
+    let category = if purchase {
+        *context.products.get(&key_of(product, None)).unwrap_or(&context.unknown_category)
+    } else {
+        0
+    };
     Some((key_of(user, Some(&context.longs)), ts, price, category))
 }
 
