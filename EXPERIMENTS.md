@@ -76,6 +76,11 @@ Calibration: v9 mirror 2.24 s vs grader 1.97 s -> factor 0.878 (tools/to_board.p
 Lessons: analysis-VM (Zen 5, 16 cores) gains roughly halve on the mirror (Ice Lake, 4 cores x 2 HT);
 memory-layout changes must be A/B'd on the mirror, interleaved (run-to-run drift is ~2-4%).
 
+Rejected (measured, analysis VM): exact two-bitmap dedup pre-filter (competitor axhiao's idea, but
+candidates compared on the real id): dedup 0.136 vs 0.137 s, no gain; our dedup is bandwidth-bound
+(reading 64 B copies + emitting), not probe-bound. Note: one gate run of this variant showed a dev
+mismatch that did not reproduce in 33 later runs (23 variant, 10 master via the same make step):
+recorded as unexplained, most likely another session touching the shared dataset; watch for it.
 Rejected (GRADER, communicator session): AVX2-only build of v30 + AVX2 paths (af52350, target
 x86-64-v3) scored 1.21 s vs v25's 1.18 s with AVX-512: AVX-512 frequency licensing is not the gap
 to the 0.84 s competitor. Master stays cascadelake/AVX-512; the AVX2 paths remain as fallback code.
