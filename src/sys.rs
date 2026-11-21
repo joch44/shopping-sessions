@@ -124,6 +124,13 @@ pub fn fallback(why: &str) -> ! {
     unsafe {
         #[allow(static_mut_refs)]
         if let Some(e) = EXEC.as_ref() {
+            // Hand the whole job to the general pipeline shipped at /fallback (our own
+            // implementation; it reads the same DATA_DIR / OUTPUT_DIR). Only if it is
+            // missing do we re-exec this binary in its own generic mode.
+            if let (Ok(d), Ok(o)) = (CString::new(e.data.as_str()), CString::new(e.out.as_str())) {
+                let argv = [c"/fallback".as_ptr(), d.as_ptr(), o.as_ptr(), std::ptr::null()];
+                execve(c"/fallback".as_ptr(), argv.as_ptr(), environ);
+            }
             execve(c"/proc/self/exe".as_ptr(), e.ptrs.as_ptr(), environ);
             execve(e.argv0.as_ptr(), e.ptrs.as_ptr(), environ);
             eprintln!("[v2b] exec failed");
