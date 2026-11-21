@@ -113,6 +113,14 @@ fn run_tasks<S: Send>(
     make: impl Fn() -> S + Sync,
     work: impl Fn(&mut S, usize) + Sync,
 ) -> Vec<S> {
+    if threads <= 1 {
+        // One worker: run on the calling thread, spawning nothing (no clone, no stack mmap).
+        let mut state = make();
+        for task in 0..count {
+            work(&mut state, task);
+        }
+        return vec![state];
+    }
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
@@ -1322,7 +1330,12 @@ fn run() -> Result<()> {
     };
     let parsed = run_tasks(threads, event_chunks.len() + 1, new_events, |state, at| {
         if at == 0 {
-            *people_slot.lock().unwrap() = Some(resolve_people(&link_maps, threads, &context.longs));
+            // The link phases run inline on this task's thread: the other pool threads are busy
+            // parsing, so their own workers would put more than NCPU threads in the runqueue.
+            // Under the scorer's `--cpus 8` (a CFS quota, no cpuset) that burns the quota early
+            // in each period and throttles every thread. LINK_THREADS overrides (experiments).
+            let link_threads = std::env::var("LINK_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0).unwrap_or(1);
+            *people_slot.lock().unwrap() = Some(resolve_people(&link_maps, link_threads, &context.longs));
         } else {
             parse_chunk(&context, None, &event_maps, &click_maps, event_chunks[at - 1], state);
         }
@@ -1419,29 +1432,42 @@ fn run() -> Result<()> {
     }
     let name = |person: Key| context.longs.bytes(person);
     let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    // At most one thread per user_daily part (<= NCPU, one per sessions worker); the small
+    // campaign_daily merge + write runs after the last part on that part's thread, so the
+    // output stage never has more than NCPU runnable threads (see the link phases above).
+    let campaign_job = Mutex::new(Some(counters));
+    let write_campaign = |counters: Vec<CampaignCounters>| {
+        let mut campaign_daily: FxHashMap<(u32, i32), CampaignCounts> = FxHashMap::default();
+        for counter in counters {
+            counter.merge_into(&mut campaign_daily);
+        }
+        let path = out.join("campaign_daily/part-00000.parquet");
+        if let Err(error) = output::write_campaign_daily_fast(&path, &campaign_daily, &campaign_rows) {
+            failures.lock().unwrap().push(error.to_string());
+        }
+    };
     std::thread::scope(|scope| {
+        let last = user_parts.len().saturating_sub(1);
         for (n, rows) in user_parts.iter().enumerate() {
-            let (out, name, category_names, failures) = (&out, &name, &category_names, &failures);
+            let (out, name, category_names, failures, campaign_job, write_campaign) =
+                (&out, &name, &category_names, &failures, &campaign_job, &write_campaign);
             scope.spawn(move || {
                 let path = out.join(format!("user_daily/part-{n:05}.parquet"));
                 if let Err(error) = output::write_user_daily_fast(&path, rows, name, category_names) {
                     failures.lock().unwrap().push(error.to_string());
                 }
+                if n == last {
+                    if let Some(counters) = campaign_job.lock().unwrap().take() {
+                        write_campaign(counters);
+                    }
+                }
             });
         }
-        let (out, failures) = (&out, &failures);
-        let campaign_rows = &campaign_rows;
-        scope.spawn(move || {
-            let mut campaign_daily: FxHashMap<(u32, i32), CampaignCounts> = FxHashMap::default();
-            for counter in counters {
-                counter.merge_into(&mut campaign_daily);
-            }
-            let path = out.join("campaign_daily/part-00000.parquet");
-            if let Err(error) = output::write_campaign_daily_fast(&path, &campaign_daily, campaign_rows) {
-                failures.lock().unwrap().push(error.to_string());
-            }
-        });
     });
+    // No user_daily parts at all: campaign_daily still has to be written.
+    if let Some(counters) = campaign_job.into_inner().unwrap() {
+        write_campaign(counters);
+    }
     if let Some(error) = failures.into_inner().unwrap().into_iter().next() {
         return Err(error.into());
     }
