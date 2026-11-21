@@ -358,33 +358,54 @@ fn resolve_people(maps: &[Option<Mmap>], threads: usize, longs: &LongIds) -> Peo
     // 2. Intern: every endpoint (pair * 2 + side) to its ID's hash bucket, then per bucket
     // a small table gives each distinct ID a local index; bucket offsets make them global.
     let bucket_of = |key: Key| (mix(key) >> (64 - BUCKET_BITS)) as usize;
-    let mut by_piece: Vec<Vec<Vec<(Key, u32)>>> = vec![Vec::new(); pieces.len()];
-    for (at, buckets) in run_tasks(threads, pieces.len(), Vec::new, |out: &mut Vec<(usize, Vec<Vec<(Key, u32)>>)>, at| {
-        let mut buckets: Vec<Vec<(Key, u32)>> = (0..BUCKETS).map(|_| Vec::new()).collect();
-        for (i, &(a, b)) in pieces[at].iter().enumerate() {
-            let end = ((first_pair[at] + i) * 2) as u32;
-            buckets[bucket_of(a)].push((a, end));
-            buckets[bucket_of(b)].push((b, end + 1));
+    // Per piece, a counting sort into one flat buffer (bucket b = flat[starts[b]..starts[b + 1]]):
+    // two allocations per piece. 256 growing Vecs per piece made every thread queue on the
+    // one malloc arena (mallopt ARENA_MAX 1): 143 ms of this phase at 60M with 8 threads.
+    type Piece = (Vec<(Key, u32)>, Vec<u32>);
+    let mut by_piece: Vec<Piece> = vec![(Vec::new(), Vec::new()); pieces.len()];
+    for (at, piece) in run_tasks(threads, pieces.len(), Vec::new, |out: &mut Vec<(usize, Piece)>, at| {
+        let pairs = &pieces[at];
+        let mut ids: Vec<u8> = Vec::with_capacity(pairs.len() * 2);
+        let mut starts = vec![0u32; BUCKETS + 1];
+        for &(a, b) in pairs.iter() {
+            let (ba, bb) = (bucket_of(a), bucket_of(b));
+            ids.push(ba as u8);
+            ids.push(bb as u8);
+            starts[ba + 1] += 1;
+            starts[bb + 1] += 1;
         }
-        out.push((at, buckets));
+        for b in 0..BUCKETS {
+            starts[b + 1] += starts[b];
+        }
+        let mut cursor = starts.clone();
+        let mut flat: Vec<(Key, u32)> = vec![(0, 0); pairs.len() * 2];
+        for (i, &(a, b)) in pairs.iter().enumerate() {
+            let end = ((first_pair[at] + i) * 2) as u32;
+            for (side, key) in [(0u32, a), (1, b)] {
+                let bucket = ids[2 * i + side as usize] as usize;
+                flat[cursor[bucket] as usize] = (key, end + side);
+                cursor[bucket] += 1;
+            }
+        }
+        out.push((at, (flat, starts)));
     })
     .into_iter()
     .flatten()
     {
-        by_piece[at] = buckets;
+        by_piece[at] = piece;
     }
     drop(pieces);
     let mut bucket_keys: Vec<Vec<Key>> = vec![Vec::new(); BUCKETS];
     let mut bucket_ends: Vec<Vec<(u32, u32)>> = vec![Vec::new(); BUCKETS];
     for (b, keys, ends) in run_tasks(threads, BUCKETS, Vec::new, |out: &mut Vec<(usize, Vec<Key>, Vec<(u32, u32)>)>, b| {
-        let entries: usize = by_piece.iter().map(|piece| piece.get(b).map_or(0, Vec::len)).sum();
+        let bucket = |piece: &Piece| -> std::ops::Range<usize> { piece.1.get(b).map_or(0..0, |&s| s as usize..piece.1[b + 1] as usize) };
+        let entries: usize = by_piece.iter().map(|piece| bucket(piece).len()).sum();
         let mask = (entries * 2).next_power_of_two().max(16) - 1;
         let mut table = vec![u32::MAX; mask + 1];
         let mut keys: Vec<Key> = Vec::new();
         let mut ends: Vec<(u32, u32)> = Vec::with_capacity(entries);
         for piece in &by_piece {
-            let Some(list) = piece.get(b) else { continue };
-            for &(key, end) in list {
+            for &(key, end) in &piece.0[bucket(piece)] {
                 let mut slot = mix(key) as usize & mask;
                 let local = loop {
                     match table[slot] {
