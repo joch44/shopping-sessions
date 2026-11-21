@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source ~/.cargo/env
-RAW=/tmp/claude-1000/pgo-raw; TGT=/tmp/claude-1000/cargo-pgo-gen
+RAW=${PGO_RAW:-/tmp/claude-1000/pgo-raw}; TGT=${PGO_TGT:-/tmp/claude-1000/cargo-pgo-gen}
 rm -rf "$RAW" && mkdir -p "$RAW"
 tools/datasets.sh practice >/dev/null; tools/datasets.sh medium >/dev/null; tools/datasets.sh dev >/dev/null; tools/datasets.sh tiny >/dev/null
 ( cd pipeline && RUSTFLAGS="-C target-cpu=cascadelake -C target-feature=+crt-static -Cprofile-generate=$RAW" \
