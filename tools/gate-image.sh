@@ -26,7 +26,7 @@ check() { if [ "$2" = "$3" ]; then echo "PASS $1"; else echo "FAIL $1 (got $2, w
 for d in "p20m-s11 11" "p20m-s13 13" "oracle-s302-e60000000-c15000000 302" "oracle-s901-e60000000-c15000000 901"; do
   set -- $d; run "$IMG" "$1" o; check "hash $1" "$(hashes o)" "$(ref "$2")"
 done
-for ep in /fallback /fallback-v3 /fallback-v2; do run "$IMG" p20m-s11 o "$ep"; check "hash $ep p20m-s11" "$(hashes o)" "$(ref 11)"; done
+for ep in ${GATE_ALT:-/fallback /fallback-v3 /fallback-v2}; do run "$IMG" p20m-s11 o "$ep"; check "hash $ep p20m-s11" "$(hashes o)" "$(ref 11)"; done
 for d in shape/p20m-user17 shape/p20m-user70 shape/p20m-eid14 shape/eiddash shape/p20m-cats; do
   run "$BASE" "$d" a; run "$IMG" "$d" b
   r=$($PY tools/compare.py "$T/a" "$T/b" | tail -1); check "shape $d vs $BASE" "$r" MATCH
