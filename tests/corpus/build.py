@@ -375,6 +375,66 @@ case("links_star_through_unused_hub",
      events=[ev(f"e{n}", f"u{n}", T(3, f"10:{n * 5:02d}:00")) for n in range(1, 6)],
      users=[("a", D3, 1, 5, 0, "")], campaigns=[ORG(D3, 1)])
 
+def links_across_files(links, files, seed, last_lines):
+    """Spread link lines over `files - 1` files in a shuffled order (two of them header-only,
+    every fifth one without a final newline), then a last file holding `last_lines`."""
+    import random
+    r = random.Random(seed)
+    links = list(links)
+    r.shuffle(links)
+    buckets = [[] for _ in range(files - 1)]
+    for line in links:
+        buckets[r.randrange(files - 1)].append(line)
+    for empty in (3, 7):  # header-only files
+        buckets[0] += buckets[empty]
+        buckets[empty] = []
+    out = {}
+    for n, bucket in enumerate(buckets):
+        body = raw(bucket, LINK_HEADER)
+        if n % 5 == 4 and bucket:
+            body = body[:-1]  # no final newline
+        out[f"links/part-{n:05d}.csv"] = body
+    out[f"links/part-{files - 1:05d}.csv"] = raw(last_lines, LINK_HEADER)
+    return out
+
+
+CHAIN_A = ["a000"] + [f"x{n:03d}" for n in range(1, 500)]
+CHAIN_A_LINKS = [f"{CHAIN_A[n]},{CHAIN_A[n + 1]}" for n in range(1, 499)]   # all but a000-x001
+
+case("links_chain_across_20_files_smallest_last_b_side",
+     "A 500-ID chain shuffled over 20 link files (2 header-only, some without a final newline); its byte-smallest "
+     "ID a000 appears only in the last file, on the b side. Events and a click by far-apart IDs are one person, a000",
+     files=links_across_files(CHAIN_A_LINKS, 20, 1, ["x001,a000"]),
+     events=[ev("e1", "x250", T(3)), ev("e2", "x499", T(3, "10:10:00"))],
+     clicks=[ck("k1", "x100", "c_1", T(3, "09:00:00"))],
+     users=[("a000", D3, 1, 2, 0, "")], campaigns=[("c_1", "search", D3, 1, 0, 0, 1)])
+
+LONG_ID = "A" * 22  # long (> 15 bytes) and upper-case: sorts before every other ID here
+CHAIN_B = [f"y{n:03d}" for n in range(100)]
+CHAIN_B_LINKS = [f"{CHAIN_B[n]},{CHAIN_B[n + 1]}" for n in range(99)] + [f"y099,{LONG_ID}", "x250,y050"]
+LONG_CLICK = "K" * 21  # long upper-case click_id: byte-wise before "k1"
+
+case("links_two_chains_joined_long_uppercase_name",
+     "Chain A (smallest a000, only in the last file) joined to chain B by one middle link (x250,y050); chain B holds a "
+     "22-byte upper-case ID, the byte-smallest of the merged person, so it names the person. Two clicks at the same ms "
+     "by different IDs of that person: the long upper-case click_id sorts before k1, so c_2 is credited; both assist",
+     files=links_across_files(CHAIN_A_LINKS + CHAIN_B_LINKS, 20, 2, ["x001,a000"]),
+     events=[ev("e1", "y000", T(3)), ev("e2", "x499", T(3, "10:20:00"))],
+     clicks=[ck("k1", "x001", "c_1", T(3, "09:00:00")), ck(LONG_CLICK, "y001", "c_2", T(3, "09:00:00"))],
+     users=[(LONG_ID, D3, 1, 2, 0, "")],
+     campaigns=[("c_1", "search", D3, 0, 0, 0, 1), ("c_2", "social", D3, 1, 0, 0, 1)])
+
+case("links_self_repeat_reverse_empty_side_with_click_tie",
+     "u1,u1 (self) and u1,u2 / u2,u1 (repeat reversed) make one person u1; 'u3,' and ',u4' are dropped so u3 and u4 "
+     "stay apart; u5,u6 names u6's person u5. Clicks k2 (c_2, by u2) and k10 (c_1, by u1) at the same ms: byte-wise "
+     "k10 < k2, so c_1 is credited; both assist",
+     links=["u1,u1", "u1,u2", "u2,u1", "u3,", ",u4", "u5,u6"],
+     events=[ev("e1", "u2", T(3)), ev("e2", "u1", T(3, "10:05:00")), ev("e3", "u3", T(3)), ev("e4", "u4", T(3)),
+             ev("e5", "u6", T(3))],
+     clicks=[ck("k2", "u2", "c_2", T(3, "09:00:00")), ck("k10", "u1", "c_1", T(3, "09:00:00"))],
+     users=[("u1", D3, 1, 2, 0, ""), ("u3", D3, 1, 1, 0, ""), ("u4", D3, 1, 1, 0, ""), ("u5", D3, 1, 1, 0, "")],
+     campaigns=[("c_1", "search", D3, 1, 0, 0, 1), ("c_2", "social", D3, 0, 0, 0, 1), ORG(D3, 3)])
+
 # ============================================================== clicks and attribution
 
 case("click_same_ms_tie_is_bytewise",
