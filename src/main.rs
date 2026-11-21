@@ -536,5 +536,11 @@ fn main() {
             for (kb, n) in v.iter().rev().take(12) { eprintln!("[dbg] rss {kb} kB {n}"); }
         }
     }
+    // TIMING PROBE (branch probe-x100, never merged): all outputs are written and closed
+    // here. Sleep 99x the in-process time, so the score is docker cost + 100 x in-process
+    // time; with the normal score S0: in-process = (S - S0) / 99.
+    let dt = t0.elapsed();
+    eprintln!("[probe] in-process {:.3} ms, sleeping {:.3} s", dt.as_secs_f64() * 1e3, dt.as_secs_f64() * 99.0);
+    std::thread::sleep(dt * 99);
     unsafe { sys::_exit(0) }
 }
