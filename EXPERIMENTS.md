@@ -18,6 +18,19 @@ dedup sort 10%, product/campaign HashMap get 5%, ts::parse+days_from_civil 5.6%,
 Indicative (analysis VM, 20M): in-process 2.81 -> 1.97-2.21 s; checksum matches.
 Mirror VM: PENDING.
 
+## v3: experiments 5-7 (gate: quick gate x4 configs PASS, incl. NCPU=40)
+5. Dedup indexes the per-thread pieces in place (no 1.6 GB concatenation copy).
+6. Flat person table (open addressing, two arrays) with software prefetch 16 lookups ahead.
+7. Partition buffers pre-sized from input bytes (77 B/event line, 47 B/click line, +15%).
+Expect: dedup -25%. Indicative A/B (analysis VM, 20M, 3 pairs): dedup 0.52-0.55 -> 0.39-0.41 s;
+wall 1.98 -> 1.78 s (-10%); checksum matches.
+Robustness: handles pack 31 pieces; more threads merge pieces (tested NCPU=40).
+Mirror VM: PENDING.
+
+## Not adopted yet
+- GLIBC_TUNABLES=glibc.malloc.hugetlb=1: -8% indicative, but only 88 MB of 4.4 GB got huge
+  pages (growing Vecs). Proper THP needs explicit madvise on pre-sized big buffers.
+
 ## Rejected / measured elsewhere (from the feasibility session, nolimit-sim, 20M)
 - Shared lock-free global dedup table: 1.7x slower than partitioning. Don't.
 - Predicting heavy people from link-component size: wrong (heaviest are whales, 3-6 IDs).

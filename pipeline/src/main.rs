@@ -15,6 +15,7 @@
 mod csv;
 mod key;
 mod output;
+mod people;
 mod ts;
 
 use std::fs::File;
@@ -29,6 +30,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::csv::{ascii_digits, data_lines, parse_line};
 use crate::key::{Key, LongIds, key_of, mix};
+use crate::people::People;
 use crate::ts::DAY_MS;
 
 const SESSION_GAP_MS: i64 = 1_800_000; // a gap OVER this starts a new session
@@ -207,7 +209,7 @@ fn load_window(data: &Path) -> Result<(i64, i64)> {
 
 /// ID key -> key of its person's name (the byte-wise smallest ID). IDs absent are their own person.
 /// Runs on one thread while the others parse events (links are ~1% of the input).
-fn resolve_people(maps: &[Option<Mmap>], longs: &LongIds) -> FxHashMap<Key, Key> {
+fn resolve_people(maps: &[Option<Mmap>], longs: &LongIds) -> People {
     let mut pairs: Vec<(Key, Key)> = Vec::new();
     for map in maps {
         let data = bytes_of(map);
@@ -259,12 +261,8 @@ fn resolve_people(maps: &[Option<Mmap>], longs: &LongIds) -> FxHashMap<Key, Key>
             smallest[root] = keys[node];
         }
     }
-    let mut people = FxHashMap::with_capacity_and_hasher(keys.len(), Default::default());
-    for node in 0..keys.len() {
-        let root = find(&mut parent, node as u32) as usize;
-        people.insert(keys[node], smallest[root]);
-    }
-    people
+    let persons: Vec<Key> = (0..keys.len()).map(|node| smallest[find(&mut parent, node as u32) as usize]).collect();
+    People::new(keys.iter().copied().zip(persons))
 }
 
 // ---------------------------------------------------------------- records
@@ -306,10 +304,7 @@ struct Context {
     longs: LongIds,
 }
 
-#[inline]
-fn person_of(people: &FxHashMap<Key, Key>, user: Key) -> Key {
-    *people.get(&user).unwrap_or(&user)
-}
+
 
 /// Events steps 3 (validate) and 4 (late) for one copy: Some((user key, ts, price, category)).
 #[inline]
@@ -357,7 +352,7 @@ struct ParseState {
 
 fn parse_chunk(
     context: &Context,
-    people: Option<&FxHashMap<Key, Key>>,
+    people: Option<&People>,
     event_maps: &[Option<Mmap>],
     click_maps: &[Option<Mmap>],
     chunk: Chunk,
@@ -399,7 +394,7 @@ fn parse_chunk(
                     return;
                 }
                 let people = people.expect("clicks are parsed after links");
-                let person = person_of(people, key_of(user, Some(&context.longs)));
+                let person = people.get(key_of(user, Some(&context.longs)));
                 let click = Click { person, click_id: key_of(click_id, Some(&context.longs)), ts, campaign };
                 state.clicks[partition(person)].push(click);
             });
@@ -409,41 +404,66 @@ fn parse_chunk(
 
 /// Events step 2 for one event_id partition: per id, the copy with the smallest
 /// (ingest_ts, file position) is kept; if it is valid it survives.
-fn dedup(copies: Vec<EventCopy>, people: &FxHashMap<Key, Key>, table: &mut Vec<u32>, out: &mut [Vec<Event>]) {
-    // Open addressing over indexes into `copies`; u32::MAX is empty. Within one partition
-    // the low hash bits are all equal, so the table uses the high bits.
-    let slots = (copies.len() * 2).next_power_of_two().max(16);
+/// Events step 2 for one event_id partition: per id, the copy with the smallest
+/// (ingest_ts, file position) is kept; if it is valid it survives. `pieces` are the
+/// per-thread vectors of this partition, indexed in place as (piece << 27 | index).
+fn dedup(pieces: Vec<Vec<EventCopy>>, people: &People, scratch: &mut DedupScratch, out: &mut [Vec<Event>]) {
+    const SHIFT: u32 = 27;
+    // Handles hold up to 31 pieces of < 2^27 copies; with more threads, merge the pieces.
+    let pieces = if pieces.len() < 32 { pieces } else { vec![pieces.into_iter().flatten().collect()] };
+    let total: usize = pieces.iter().map(Vec::len).sum();
+    assert!(pieces.iter().all(|p| p.len() < 1 << SHIFT), "dedup partition over 134M copies");
+    let get = |handle: u32| &pieces[(handle >> SHIFT) as usize][(handle & ((1 << SHIFT) - 1)) as usize];
+    // Open addressing over handles; u32::MAX is empty. Within one partition the low hash
+    // bits are all equal, so the table uses the high bits.
+    let slots = (total * 2).next_power_of_two().max(16);
+    let table = &mut scratch.table;
     table.clear();
     table.resize(slots, u32::MAX);
     let mask = slots - 1;
-    for (index, copy) in copies.iter().enumerate() {
-        let mut slot = (mix(copy.id) >> 32) as usize & mask;
-        loop {
-            let held = table[slot];
-            if held == u32::MAX {
-                table[slot] = index as u32;
-                break;
-            }
-            let other = &copies[held as usize];
-            if other.id == copy.id {
-                if (copy.ingest, copy.seq) < (other.ingest, other.seq) {
-                    table[slot] = index as u32;
+    for (piece_index, piece) in pieces.iter().enumerate() {
+        for (index, copy) in piece.iter().enumerate() {
+            let handle = ((piece_index as u32) << SHIFT) | index as u32;
+            let mut slot = (mix(copy.id) >> 32) as usize & mask;
+            loop {
+                let held = table[slot];
+                if held == u32::MAX {
+                    table[slot] = handle;
+                    break;
                 }
-                break;
+                let other = get(held);
+                if other.id == copy.id {
+                    if (copy.ingest, copy.seq) < (other.ingest, other.seq) {
+                        table[slot] = handle;
+                    }
+                    break;
+                }
+                slot = (slot + 1) & mask;
             }
-            slot = (slot + 1) & mask;
         }
     }
-    for &held in table.iter() {
-        if held == u32::MAX {
-            continue;
-        }
-        let copy = &copies[held as usize];
-        if copy.valid {
-            let person = person_of(people, copy.user);
-            out[partition(person)].push(Event { person, ts: copy.ts, price: copy.price, category: copy.category });
-        }
+    let survivors = &mut scratch.survivors;
+    survivors.clear();
+    survivors.extend(table.iter().copied().filter(|&h| h != u32::MAX && get(h).valid));
+    // Person lookups miss the cache: issue each one 16 survivors ahead.
+    const AHEAD: usize = 16;
+    for &handle in survivors.iter().take(AHEAD) {
+        people.prefetch(get(handle).user);
     }
+    for at in 0..survivors.len() {
+        if let Some(&ahead) = survivors.get(at + AHEAD) {
+            people.prefetch(get(ahead).user);
+        }
+        let copy = get(survivors[at]);
+        let person = people.get(copy.user);
+        out[partition(person)].push(Event { person, ts: copy.ts, price: copy.price, category: copy.category });
+    }
+}
+
+#[derive(Default)]
+struct DedupScratch {
+    table: Vec<u32>,
+    survivors: Vec<u32>,
 }
 
 // ---------------------------------------------------------------- sessions, attribution, aggregation
@@ -644,12 +664,21 @@ fn run() -> Result<()> {
     let mut event_chunks = Vec::new();
     chunks_of(Kind::Event, &event_maps, &mut event_chunks);
     event_chunks.sort_by_key(|chunk| std::cmp::Reverse(chunk.end - chunk.start));
-    let people_slot: Mutex<Option<FxHashMap<Key, Key>>> = Mutex::new(None);
-    let new_state = || ParseState {
-        events: (0..PARTITIONS).map(|_| Vec::new()).collect(),
+    let people_slot: Mutex<Option<People>> = Mutex::new(None);
+    // Pre-size each thread's partition buffers from the input size (~77 bytes per event
+    // line, ~47 per click line, 15% slack), so they rarely regrow; a wrong guess only costs speed.
+    let total_bytes = |maps: &[Option<Mmap>]| maps.iter().map(|m| bytes_of(m).len()).sum::<usize>();
+    let per_buffer = |bytes: usize, line: usize| bytes / line * 115 / 100 / threads / PARTITIONS;
+    let (event_cap, click_cap) = (per_buffer(total_bytes(&event_maps), 77), per_buffer(total_bytes(&click_maps), 47));
+    let new_events = || ParseState {
+        events: (0..PARTITIONS).map(|_| Vec::with_capacity(event_cap)).collect(),
         clicks: (0..PARTITIONS).map(|_| Vec::new()).collect(),
     };
-    let parsed = run_tasks(threads, event_chunks.len() + 1, new_state, |state, at| {
+    let new_clicks = || ParseState {
+        events: (0..PARTITIONS).map(|_| Vec::new()).collect(),
+        clicks: (0..PARTITIONS).map(|_| Vec::with_capacity(click_cap)).collect(),
+    };
+    let parsed = run_tasks(threads, event_chunks.len() + 1, new_events, |state, at| {
         if at == 0 {
             *people_slot.lock().unwrap() = Some(resolve_people(&link_maps, &context.longs));
         } else {
@@ -661,7 +690,7 @@ fn run() -> Result<()> {
     let mut click_chunks = Vec::new();
     chunks_of(Kind::Click, &click_maps, &mut click_chunks);
     click_chunks.sort_by_key(|chunk| std::cmp::Reverse(chunk.end - chunk.start));
-    let clicked = run_tasks(threads, click_chunks.len(), new_state, |state, at| {
+    let clicked = run_tasks(threads, click_chunks.len(), new_clicks, |state, at| {
         parse_chunk(&context, Some(&people), &event_maps, &click_maps, click_chunks[at], state)
     });
     let event_parts = transpose(parsed.into_iter().map(|s| s.events).collect());
@@ -672,8 +701,8 @@ fn run() -> Result<()> {
     let deduped = run_tasks(
         threads,
         PARTITIONS,
-        || (Vec::new(), (0..PARTITIONS).map(|_| Vec::new()).collect::<Vec<Vec<Event>>>()),
-        |(table, out), p| dedup(take_all(&event_parts[p]), &people, table, out),
+        || (DedupScratch::default(), (0..PARTITIONS).map(|_| Vec::new()).collect::<Vec<Vec<Event>>>()),
+        |(scratch, out), p| dedup(std::mem::take(&mut *event_parts[p].lock().unwrap()), &people, scratch, out),
     );
     let deduped: Vec<Vec<Vec<Event>>> = deduped.into_iter().map(|(_, out)| out).collect();
     let person_events = transpose(deduped);
