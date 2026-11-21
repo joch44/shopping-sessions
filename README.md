@@ -13,4 +13,4 @@ A merge of two pipelines:
   path's own generic mode.
 
 Our changes on top of Team 67's code are listed in the git history after
-commit 92cf412. `tools/docker-impl.sh` runs the image as a gate adapter.
+commit f122b64. `tools/docker-impl.sh` runs the image as a gate adapter.
