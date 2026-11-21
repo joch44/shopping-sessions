@@ -16,7 +16,7 @@ dedup sort 10%, product/campaign HashMap get 5%, ts::parse+days_from_civil 5.6%,
 3. Date cache in ts::parse (thread-local last date). Expect: -3% CPU.
 4. Exit right after outputs close (no teardown). Expect: -0.1 s.
 Indicative (analysis VM, 20M): in-process 2.81 -> 1.97-2.21 s; checksum matches.
-Mirror VM: PENDING.
+Mirror VM: 3.17 s @20M (3.62), 9.00 s @60M (10.68). All outputs match.
 
 ## v3: experiments 5-7 (gate: quick gate x4 configs PASS, incl. NCPU=40)
 5. Dedup indexes the per-thread pieces in place (no 1.6 GB concatenation copy).
@@ -25,7 +25,7 @@ Mirror VM: PENDING.
 Expect: dedup -25%. Indicative A/B (analysis VM, 20M, 3 pairs): dedup 0.52-0.55 -> 0.39-0.41 s;
 wall 1.98 -> 1.78 s (-10%); checksum matches.
 Robustness: handles pack 31 pieces; more threads merge pieces (tested NCPU=40).
-Mirror VM: PENDING.
+Mirror VM: 3.01 s @20M, 8.81 s @60M. All outputs match.
 
 ## Not adopted yet
 - GLIBC_TUNABLES=glibc.malloc.hugetlb=1: -8% indicative, but only 88 MB of 4.4 GB got huge
@@ -37,3 +37,29 @@ Mirror VM: PENDING.
 - Measured wins to try: THP via madvise for big buffers (-26..-58% on lookup/dedup),
   24-byte pre-dedup records, write-combining scatter buffers (needs THP), ~1024 dedup
   partitions with L2-sized tables, software prefetch for person lookup.
+
+## Mirror results v4-v15 (nolimit-sim, nolimit-run, medians; every output checked against tools/checksums.csv)
+
+| ver | change | 20M | 60M | note |
+|---|---|---|---|---|
+| v4 | skip product lookup for views/carts (feasibility session) | 2.94 | 8.49 | |
+| v5 | 1024 dedup partitions, explicit date cache, single-pass splitter, 64 B copies | 2.66 | 7.72 | dedup 0.49 -> 0.33 |
+| v6 | hash-grouped sessions (counting sort) | 2.57 | 7.36 | |
+| v7 | AVX-512 record splitter (masked loads) + SIMD u128 ID packing | 2.44 | 7.06 | ideas from the feasibility prototype |
+| v8 | THP allocator, >= 1 MiB | 2.36 | 7.17 | 60M regressed: per-partition temps lost glibc recycling |
+| v9 | sessions reuse scratch, pieces in place | 2.24 | 6.67 | **submitted: 1.97 s on the grader** |
+| v10 | timestamp fast paths | | | profile: date cache missed 93% (shuffled rows) |
+| v11 | month-keyed 16-slot date cache, branch-free digit check | ~2.20 | 6.65 | |
+| v12 | THP threshold 16 MiB (research session) | ~2.21 | 6.40 | ~= v9 at 20M in interleaved A/B |
+| v13 | tagged person table (research R5) | | | |
+| v14 | per-thread scatter arenas (research R3, one region per partition) | 2.02 | 5.61 | interleaved vs v9: 2.16 / 6.56 |
+| v15 | dedup table (hash32, index), sequential winner emit | PENDING | | dedup 0.166 -> 0.128 s (analysis) |
+
+Calibration: v9 mirror 2.24 s vs grader 1.97 s -> factor 0.878 (tools/to_board.py). Target <1.0 s grader
+~= 1.1 s mirror. Container start/stop floor ~0.34 s (research): in-process budget ~0.75 s @20M.
+
+Lessons: analysis-VM (Zen 5, 16 cores) gains roughly halve on the mirror (Ice Lake, 4 cores x 2 HT);
+memory-layout changes must be A/B'd on the mirror, interleaved (run-to-run drift is ~2-4%).
+
+Rejected: GLIBC_TUNABLES hugetlb (88 MB of 4.4 GB got huge pages); THP threshold 1 MiB (v8);
+shared global dedup table (feasibility, 1.7x slower); software write-combining (no gain on Ice Lake, research).
