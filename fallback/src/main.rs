@@ -34,7 +34,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::csv::{ascii_digits, data_lines, for_each_record, parse_line};
 use crate::compact::EventCopy32;
-use crate::key::{Key, LongIds, key_of, mix};
+use crate::key::{Key, LongIds, key_of, key_of_deferred, mix};
 use crate::people::People;
 use crate::blocks::BlockScatter;
 use crate::scatter::Scatter;
@@ -330,10 +330,10 @@ fn resolve_people(maps: &[Option<Mmap>], threads: usize, longs: &LongIds) -> Peo
         for_each_record::<2>(bytes_of(&maps[file]), start, end, |fields, _| {
             // Step 1: malformed lines and lines with an empty side are dropped.
             if let (Some(a), Some(b)) = (fields[0], fields[1]) {
-                pairs.push((key_of(a, Some(longs)), key_of(b, Some(longs))));
+                pairs.push((key_of_deferred(a, longs), key_of_deferred(b, longs)));
             }
         });
-        longs.flush();
+        longs.close_unit();
         out.push((at, pairs));
     })
     .into_iter()
@@ -341,6 +341,8 @@ fn resolve_people(maps: &[Option<Mmap>], threads: usize, longs: &LongIds) -> Peo
     {
         pieces[at] = pairs;
     }
+    // Link IDs' bytes are compared when naming components below.
+    longs.build(threads);
     let mut first_pair = Vec::with_capacity(pieces.len() + 1);
     let mut pair_count = 0usize;
     for piece in &pieces {
@@ -654,7 +656,7 @@ fn parse_chunk(
                         let copy = match judge(context, fields, ingest, &mut state.dates) {
                             Some((user, ts, price, category)) => {
                                 let user = compact::pack62(user).unwrap_or_else(|| {
-                                    state.slow_users.push(key_of(user, Some(&context.longs)));
+                                    state.slow_users.push(key_of_deferred(user, &context.longs));
                                     compact::SLOW_USER | state.thread << 40 | (state.slow_users.len() as u64 - 1)
                                 });
                                 EventCopy32 { id, user, ingest, ts: (ts - window_start) as u32, price_cat: price << 8 | category }
@@ -668,7 +670,7 @@ fn parse_chunk(
                 let id = key_of(event_id, None);
                 let seq = file_seq | offset as u64;
                 let copy = match judge(context, fields, ingest, &mut state.dates) {
-                    Some((user, ts, price, category)) => EventCopy { id, user: key_of(user, Some(&context.longs)), seq, ingest, ts, price, category },
+                    Some((user, ts, price, category)) => EventCopy { id, user: key_of_deferred(user, &context.longs), seq, ingest, ts, price, category },
                     None => EventCopy { id, user: 0, seq, ingest, ts: 0, price: INVALID, category: 0 },
                 };
                 state.events.push(dedup_partition(id), copy);
@@ -690,9 +692,9 @@ fn parse_chunk(
                     return;
                 }
                 // The person lookup misses the cache: prefetch now, resolve when the batch fills.
-                let user = key_of(user, Some(&context.longs));
+                let user = key_of_deferred(user, &context.longs);
                 people.prefetch(user);
-                pending.push((user, Click { person: 0, click_id: key_of(click_id, Some(&context.longs)), ts, campaign }));
+                pending.push((user, Click { person: 0, click_id: key_of_deferred(click_id, &context.longs), ts, campaign }));
                 if pending.len() == CLICK_BATCH {
                     flush_clicks(people, &mut pending, &mut state.clicks);
                 }
@@ -700,8 +702,10 @@ fn parse_chunk(
             flush_clicks(people, &mut pending, &mut state.clicks);
         }
     }
-    // Long IDs this chunk noted go to the shared table before anything reads them.
+    // Long IDs this chunk noted go to the shared table before anything reads them; deferred
+    // ones become a batch for LongIds::build after parsing.
     context.longs.flush();
+    context.longs.close_unit();
 }
 
 const CLICK_BATCH: usize = 64; // research sweep: 16/32/64/128 -> 0.125/0.118/0.116/0.116 s (mirror, 20M)
@@ -1437,6 +1441,8 @@ fn run() -> Result<()> {
         event32_parts.push(state.events32);
     }
     let click_parts: Vec<BlockScatter<Click>> = clicked.into_iter().map(|s| s.clicks).collect();
+    // Deferred long IDs (event and click IDs) become readable here, before sessions and output.
+    context.longs.build(threads);
     timer.mark("parse clicks");
     // Unmap the input files on one helper thread now that parsing is done (after
     // hansliu-dev/676767): exit then has ~2 GB less of file page tables to tear down on one thread.
