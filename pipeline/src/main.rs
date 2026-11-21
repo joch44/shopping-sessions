@@ -17,6 +17,7 @@ mod hugealloc;
 mod key;
 mod output;
 mod people;
+mod pqw;
 mod scatter;
 mod ts;
 
@@ -866,7 +867,7 @@ fn run() -> Result<()> {
             let (out, name, category_names, failures) = (&out, &name, &category_names, &failures);
             scope.spawn(move || {
                 let path = out.join(format!("user_daily/part-{n:05}.parquet"));
-                if let Err(error) = output::write_user_daily(&path, rows, name, category_names) {
+                if let Err(error) = output::write_user_daily_fast(&path, rows, name, category_names) {
                     failures.lock().unwrap().push(error.to_string());
                 }
             });
@@ -876,7 +877,7 @@ fn run() -> Result<()> {
         let campaign_rows = &campaign_rows;
         scope.spawn(move || {
             let path = out.join("campaign_daily/part-00000.parquet");
-            if let Err(error) = output::write_campaign_daily(&path, campaign_daily, campaign_rows) {
+            if let Err(error) = output::write_campaign_daily_fast(&path, campaign_daily, campaign_rows) {
                 failures.lock().unwrap().push(error.to_string());
             }
         });
@@ -885,7 +886,7 @@ fn run() -> Result<()> {
         return Err(error.into());
     }
     if user_parts.is_empty() {
-        output::write_user_daily(&out.join("user_daily/part-00000.parquet"), &[], &name, &category_names)?;
+        output::write_user_daily_fast(&out.join("user_daily/part-00000.parquet"), &[], &name, &category_names)?;
     }
     timer.mark("parquet");
     Ok(())
