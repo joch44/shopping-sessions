@@ -1,0 +1,15 @@
+mn b -
+rc0 =mn - XL_RECYCLE=0
+dt b -
+k b -
+a7 b -
+m1 b -
+m2 b -
+m3 b -
+17 b -
+fr b -
+fr0 =fr - XL_RELK=1 XL_IOADV=0 XL_R3=0
+e2 b -
+o2 b -
+c2 b -
+18 b -
