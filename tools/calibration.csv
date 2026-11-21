@@ -4,3 +4,4 @@
 2026-11-21,shopping-sessions v20,0e62970,20000000,1.73,1.60,"Rust v20; sim = interleaved median p20m-s11 (bench medians 1.77-1.80 over seeds 11-13, all MATCH); board = practice score"
 2026-11-21,shopping-sessions v25,e71539c,20000000,1.40,1.18,"Rust v25 (PEXT splitter + PGO); sim = mirror bench median p20m seeds 11-13 (EXPERIMENTS v25 row, all MATCH); board = practice score"
 2026-11-21,shopping-sessions v31,3261746,20000000,1.274,1.13,"Rust v31; sim = interleaved median p20m-s11 vs v30 (bench medians 1.25-1.26 over seeds 11-13, all MATCH); board = practice score"
+2026-11-21,shopping-sessions v33,39f5ad2,20000000,,1.09,"Rust v33 (mallopt ARENA_MAX 1, TOP_PAD 64 MiB); board = practice score; Azure-mirror sim pending"

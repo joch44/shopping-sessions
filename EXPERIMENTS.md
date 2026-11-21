@@ -69,6 +69,8 @@ Mirror VM: 3.01 s @20M, 8.81 s @60M. All outputs match.
 | v29 | research: incremental assists window | 1.30 | 3.26 | interleaved vs v26: 1.348 / 3.596 (-0.34 s at 60M) |
 | v30 | research ts32 sessions (u32 offsets, i64 fallback for long windows added here) + plain click keys | 1.27 | 3.29 | interleaved vs v29: 1.303 / 3.321 |
 | v31 | research one-pass grouping in sessions | 1.27 | 3.28 | interleaved vs v30: 1.283 / 3.336; **submitted: 1.13 s on the grader** |
+| v32 | remove v26 parallel exit teardown (could zero live thread stacks: no-THP build segfaulted on GCP) | 1.27 | | crash fix |
+| v33 | communicator: mallopt ARENA_MAX 1 + TOP_PAD 64 MiB (research finding: mmap_lock convoys on kernel 6.1) | | | **graded 1.09 s** (v31 1.13) |
 
 Calibration: v9 mirror 2.24 s vs grader 1.97 s -> factor 0.878 (tools/to_board.py). Target <1.0 s grader
 ~= 1.1 s mirror. Container start/stop floor ~0.34 s (research): in-process budget ~0.75 s @20M.
@@ -76,6 +78,11 @@ Calibration: v9 mirror 2.24 s vs grader 1.97 s -> factor 0.878 (tools/to_board.p
 Lessons: analysis-VM (Zen 5, 16 cores) gains roughly halve on the mirror (Ice Lake, 4 cores x 2 HT);
 memory-layout changes must be A/B'd on the mirror, interleaved (run-to-run drift is ~2-4%).
 
+GCP n2 VM (THP always, kernel 6.1), stage profile vs Azure mirror (kernel 7.0), v31 at 20M:
+parse events 0.36 -> 0.73 s, clicks 0.10 -> 0.13, dedup 0.21 -> 0.25, sessions 0.17 -> 0.18;
+cores busy 7.4 -> 5.4 (idle, not sys time); compact_stall 0 and no-madvise / nothp variants equal
+(defrag ruled out); plain system allocator 1.64 vs 1.43 s (worse). sched_switch stacks: 19.6k
+page-fault sleeps on mmap_lock behind 6.2k glibc-arena mprotect writers -> v33.
 Rejected (measured, analysis VM): exact two-bitmap dedup pre-filter (competitor axhiao's idea, but
 candidates compared on the real id): dedup 0.136 vs 0.137 s, no gain; our dedup is bandwidth-bound
 (reading 64 B copies + emitting), not probe-bound. Note: one gate run of this variant showed a dev
