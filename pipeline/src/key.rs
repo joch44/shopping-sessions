@@ -11,9 +11,10 @@
 //! colliding in 120 bits is the one accepted risk (about 2^-120 per pair).
 
 use std::cmp::Ordering;
-use std::sync::Mutex;
+use std::cell::RefCell;
+use std::sync::RwLock;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 pub type Key = u128;
 const LONG: u8 = 0xFF;
@@ -23,16 +24,91 @@ pub fn is_long(key: Key) -> bool {
 }
 
 /// Long IDs whose bytes may be needed later (user, click and link IDs).
+///
+/// Written from every parse thread, so no global lock per occurrence (a single Mutex here made
+/// 17-byte user_ids 11x slower at 20M): each thread notes a long ID once in a thread-local
+/// seen-set and buffer, and `flush` (called at the end of each work unit) moves the new ones
+/// into 256 shards, one write lock per shard touched. Reads take a shard's read lock.
+pub struct LongIds {
+    shards: Vec<RwLock<FxHashMap<Key, Box<[u8]>>>>,
+}
+
+const SHARD_BITS: u32 = 8;
+
+impl Default for LongIds {
+    fn default() -> Self {
+        Self { shards: (0..1 << SHARD_BITS).map(|_| RwLock::new(FxHashMap::default())).collect() }
+    }
+}
+
+#[inline]
+fn shard_of(key: Key) -> usize {
+    // The lowest byte is the LONG marker; the hash bits above it are uniform.
+    ((key >> 8) as usize) & ((1 << SHARD_BITS) - 1)
+}
+
+/// This thread's long IDs not yet flushed into `owner` (a LongIds address).
 #[derive(Default)]
-pub struct LongIds(Mutex<FxHashMap<Key, Box<[u8]>>>);
+struct Local {
+    owner: usize,
+    seen: FxHashSet<Key>,
+    pending: Vec<(Key, u32, u32)>,
+    bytes: Vec<u8>,
+}
+
+thread_local! {
+    static LOCAL: RefCell<Local> = RefCell::new(Local::default());
+}
 
 impl LongIds {
+    #[inline]
+    fn note(&self, key: Key, id: &[u8]) {
+        LOCAL.with(|local| {
+            let mut local = local.borrow_mut();
+            let me = self as *const Self as usize;
+            if local.owner != me {
+                debug_assert!(local.pending.is_empty(), "long IDs noted for another table were not flushed");
+                *local = Local { owner: me, ..Local::default() };
+            }
+            if local.seen.insert(key) {
+                let start = local.bytes.len() as u32;
+                local.bytes.extend_from_slice(id);
+                local.pending.push((key, start, id.len() as u32));
+            }
+        });
+    }
+
+    /// Moves this thread's newly seen long IDs into the shared shards. Call at the end of every
+    /// work unit that called `key_of(.., Some(self))`, before anything reads them.
+    pub fn flush(&self) {
+        LOCAL.with(|local| {
+            let mut local = local.borrow_mut();
+            if local.owner != self as *const Self as usize || local.pending.is_empty() {
+                return;
+            }
+            let Local { pending, bytes, .. } = &mut *local;
+            pending.sort_unstable_by_key(|&(key, _, _)| shard_of(key));
+            for run in pending.chunk_by(|a, b| shard_of(a.0) == shard_of(b.0)) {
+                let mut shard = self.shards[shard_of(run[0].0)].write().unwrap();
+                for &(key, start, len) in run {
+                    shard.entry(key).or_insert_with(|| bytes[start as usize..(start + len) as usize].into());
+                }
+            }
+            pending.clear();
+            bytes.clear();
+        });
+    }
+
     pub fn bytes(&self, key: Key) -> Vec<u8> {
-        if is_long(key) {
-            self.0.lock().unwrap().get(&key).map(|b| b.to_vec()).unwrap_or_default()
-        } else {
-            short_bytes(key)
+        if !is_long(key) {
+            return short_bytes(key);
         }
+        if let Some(b) = self.shards[shard_of(key)].read().unwrap().get(&key) {
+            return b.to_vec();
+        }
+        // Not flushed yet: only this thread's own pending IDs can be missing.
+        self.flush();
+        self.shards[shard_of(key)].read().unwrap().get(&key).map(|b| b.to_vec()).unwrap_or_default()
     }
 }
 
@@ -65,7 +141,7 @@ pub fn key_of(id: &[u8], longs: Option<&LongIds>) -> Key {
     } else {
         let key = (xxhash_rust::xxh3::xxh3_128(id) << 8) | Key::from(LONG);
         if let Some(longs) = longs {
-            longs.0.lock().unwrap().entry(key).or_insert_with(|| id.into());
+            longs.note(key, id);
         }
         key
     }
@@ -136,5 +212,27 @@ mod tests {
         assert_eq!(cmp(kc, ka, &longs), c.cmp(a));
         assert_eq!(longs.bytes(ka), a);
         assert_eq!(key_of(a, None), ka);
+    }
+
+    #[test]
+    fn long_ids_from_many_threads_are_all_kept() {
+        let longs = LongIds::default();
+        let ids: Vec<Vec<u8>> = (0..20000u32).map(|n| format!("a-rather-long-user-id-{n:08}").into_bytes()).collect();
+        std::thread::scope(|scope| {
+            for t in 0..8 {
+                let (ids, longs) = (&ids, &longs);
+                scope.spawn(move || {
+                    for (i, id) in ids.iter().enumerate() {
+                        if i % 8 == t || i % 3 == 0 {
+                            key_of(id, Some(longs));
+                        }
+                    }
+                    longs.flush();
+                });
+            }
+        });
+        for id in &ids {
+            assert_eq!(longs.bytes(key_of(id, None)), *id);
+        }
     }
 }

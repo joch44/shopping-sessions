@@ -172,6 +172,32 @@ fn map_folder(folder: &Path) -> Result<Vec<Option<Mmap>>> {
     Ok(maps)
 }
 
+/// Whether at least 98% of sampled event rows have an event_id and a user_id that pack into
+/// 62 bits (compact.rs): up to 2048 records from the start of each of up to 16 event files
+/// spread over the list (the header line skipped). The answer only picks the faster path; both
+/// paths give identical output.
+fn mostly_packable(maps: &[Option<Mmap>]) -> bool {
+    let files: Vec<&[u8]> = maps.iter().map(bytes_of).filter(|b| !b.is_empty()).collect();
+    let step = files.len().div_ceil(16).max(1);
+    let (mut rows, mut unpackable) = (0usize, 0usize);
+    for data in files.iter().step_by(step) {
+        let Some(first) = memchr::memchr(b'\n', data) else { continue };
+        let end = data.len().min(first + 1 + (256 << 10));
+        let mut seen = 0;
+        for_each_record::<7>(data, first + 1, end, |fields, _| {
+            if seen < 2048 {
+                seen += 1;
+                rows += 1;
+                let packs = |field: Option<&[u8]>| field.is_none_or(|v| compact::pack62(v).is_some());
+                if !packs(fields[0]) || !packs(fields[1]) {
+                    unpackable += 1;
+                }
+            }
+        });
+    }
+    unpackable * 50 <= rows
+}
+
 fn bytes_of(map: &Option<Mmap>) -> &[u8] {
     map.as_deref().unwrap_or(&[])
 }
@@ -305,6 +331,7 @@ fn resolve_people(maps: &[Option<Mmap>], threads: usize, longs: &LongIds) -> Peo
                 pairs.push((key_of(a, Some(longs)), key_of(b, Some(longs))));
             }
         });
+        longs.flush();
         out.push((at, pairs));
     })
     .into_iter()
@@ -638,6 +665,8 @@ fn parse_chunk(
             flush_clicks(people, &mut pending, &mut state.clicks);
         }
     }
+    // Long IDs this chunk noted go to the shared table before anything reads them.
+    context.longs.flush();
 }
 
 const CLICK_BATCH: usize = 64; // research sweep: 16/32/64/128 -> 0.125/0.118/0.116/0.116 s (mirror, 20M)
@@ -1299,9 +1328,13 @@ fn run() -> Result<()> {
 
     // Compact copies hold the category in 8 bits and ts as u32 ms after window_start: a wider
     // category set or a window of 2^32 ms (~49.7 days) or more takes the 64-byte path.
+    // IDs that do not pack into 62 bits take a slow per-row fallback on the compact path (a
+    // 64-byte copy into an unsized side scatter, or a side-table user): with many of them the
+    // compact path is 2-4x slower than the plain 64-byte one, so sample the event files first.
     let compact = category_names.len() <= 256
         && window.1.saturating_sub(window.0) < (1i64 << 32)
-        && std::env::var_os("PIPE_LEGACY").is_none();
+        && std::env::var_os("PIPE_LEGACY").is_none()
+        && mostly_packable(&event_maps);
     let context = Context { window, products, unknown_category, campaigns, longs: LongIds::default(), compact };
 
     // A+B. Task 0 resolves links while the other threads parse events (largest chunks

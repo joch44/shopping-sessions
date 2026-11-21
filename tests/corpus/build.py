@@ -228,6 +228,16 @@ case("ts_window_longer_than_2_pow_32_ms",
 
 # ============================================================== events: dedup, validation, lateness
 
+case("long_user_ids_linked_and_clicking",
+     "user_ids and click_ids over 15 bytes (stored by hash with their bytes on the side): a link "
+     "joins two long ids (the smaller becomes the person), clicks attribute, output names are exact",
+     links=["alpha-user-identifier-0001,alpha-user-identifier-0002"],
+     events=[ev("e1", "alpha-user-identifier-0002", T(3, "10:00:00"), kind="purchase", price="700"),
+             ev("e2", "alpha-user-identifier-0001", T(3, "10:05:00"))],
+     clicks=[ck("click-identifier-long-0001", "alpha-user-identifier-0001", "c_1", T(3, "09:59:00"))],
+     users=[("alpha-user-identifier-0001", D3, 1, 2, 700, "shoes")],
+     campaigns=[("c_1", "search", D3, 1, 1, 700, 1)])
+
 LONG_U = "user_with_a_rather_long_id_0001"  # 31 chars: does not pack into 62 bits
 case("dedup_identical_copies_equal_ingest_long_user_id",
      "two identical copies (same ingest_ts) of one purchase by a 31-char user_id, in two files; "

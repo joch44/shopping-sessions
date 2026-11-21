@@ -83,7 +83,8 @@ fn parse_exact(value: &[u8], dates: &mut DateCache) -> Option<i64> {
         for &byte in value {
             let d = byte.wrapping_sub(b'0');
             digits &= d < 10;
-            result = result * 10 + i64::from(d);
+            // Wrapping: a non-digit makes `result` garbage, discarded below (debug builds trap).
+            result = result.wrapping_mul(10).wrapping_add(i64::from(d));
         }
         // Not all digits and shorter than F1/F2: not a timestamp.
         return digits.then_some(result);
