@@ -13,6 +13,6 @@ done
 id=$(sudo docker create "$IMG"); sudo docker cp "$id:/pipeline" /srv/nolimit/bin/pipeline-$TAG >/dev/null; sudo docker rm "$id" >/dev/null
 exec 9>/srv/nolimit/run.lock; flock 9; exec 8>>/tmp/feas-bench.lock; flock 8; sync; sleep 1
 for ds in p20m-s11 f60m-s301; do
-  echo "-- stages $ds"; rm -rf /tmp/tout
-  TIMING=1 NCPU=8 DATA_DIR=/srv/nolimit/datasets/$ds OUTPUT_DIR=/tmp/tout taskset -c 0-7 /srv/nolimit/bin/pipeline-$TAG 2>&1 | sed 's/\[timing\] //'
+  echo "-- stages $ds"; rm -rf /tmp/tout-$TAG
+  TIMING=1 NCPU=8 DATA_DIR=/srv/nolimit/datasets/$ds OUTPUT_DIR=/tmp/tout-$TAG taskset -c 0-7 /srv/nolimit/bin/pipeline-$TAG 2>&1 | sed 's/\[timing\] //'
 done

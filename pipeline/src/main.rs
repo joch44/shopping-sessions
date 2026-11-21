@@ -24,11 +24,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use memchr::memchr;
 use memmap2::Mmap;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::csv::{ascii_digits, data_lines, parse_line};
+use crate::csv::{ascii_digits, data_lines, for_each_record, parse_line};
 use crate::key::{Key, LongIds, key_of, mix};
 use crate::people::People;
 use crate::ts::DAY_MS;
@@ -165,20 +164,6 @@ fn chunks_of(kind: Kind, maps: &[Option<Mmap>], out: &mut Vec<Chunk>) {
     }
 }
 
-/// Calls `f(line, offset)` for every data line starting in `start..end`. The file's first
-/// line (the header) starts at 0 and is skipped; only `\n` ends a line.
-#[inline]
-fn for_each_line<'a>(data: &'a [u8], start: usize, end: usize, mut f: impl FnMut(&'a [u8], usize)) {
-    let first = if start == 0 { memchr(b'\n', data) } else { memchr(b'\n', &data[start - 1..]).map(|i| i + start - 1) };
-    let Some(newline) = first else { return };
-    let mut pos = newline + 1;
-    while pos < end && pos < data.len() {
-        let line_end = memchr(b'\n', &data[pos..]).map_or(data.len(), |i| pos + i);
-        f(&data[pos..line_end], pos);
-        pos = line_end + 1;
-    }
-}
-
 /// products.csv / campaigns.csv: first column -> second column (first occurrence wins).
 fn load_lookup(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
     let Ok(bytes) = std::fs::read(path) else { return Vec::new() };
@@ -214,12 +199,9 @@ fn resolve_people(maps: &[Option<Mmap>], longs: &LongIds) -> People {
     let mut pairs: Vec<(Key, Key)> = Vec::new();
     for map in maps {
         let data = bytes_of(map);
-        let mut fields = [None; 2];
-        for_each_line(data, 0, data.len(), |line, _| {
-            if parse_line(line, &mut fields) {
-                if let (Some(a), Some(b)) = (fields[0], fields[1]) {
-                    pairs.push((key_of(a, Some(longs)), key_of(b, Some(longs))));
-                }
+        for_each_record::<2>(data, 0, data.len(), |fields, _| {
+            if let (Some(a), Some(b)) = (fields[0], fields[1]) {
+                pairs.push((key_of(a, Some(longs)), key_of(b, Some(longs))));
             }
         });
     }
@@ -375,17 +357,14 @@ fn parse_chunk(
     let (start_ms, end_ms) = (context.window.0.saturating_sub(CLICK_REACH_MS), context.window.1);
     match chunk.kind {
         Kind::Event => {
-            let mut fields = [None; 7];
             let file_seq = (chunk.file as u64) << 40;
-            for_each_line(bytes_of(&event_maps[chunk.file]), chunk.start, chunk.end, |line, offset| {
-                if !parse_line(line, &mut fields) {
-                    return; // step 1: malformed
-                }
+            // Step 1: for_each_record drops malformed lines.
+            for_each_record::<7>(bytes_of(&event_maps[chunk.file]), chunk.start, chunk.end, |fields, offset| {
                 let Some(event_id) = fields[0] else { return }; // step 1: empty event_id
                 let id = key_of(event_id, None);
                 let ingest = fields[3].and_then(|v| ts::parse_cached(v, &mut state.dates)).unwrap_or(NEVER);
                 let seq = file_seq | offset as u64;
-                let copy = match judge(context, &fields, ingest, &mut state.dates) {
+                let copy = match judge(context, fields, ingest, &mut state.dates) {
                     Some((user, ts, price, category)) => EventCopy { id, user, seq, ingest, ts, price, category },
                     None => EventCopy { id, user: 0, seq, ingest, ts: 0, price: INVALID, category: 0 },
                 };
@@ -393,15 +372,11 @@ fn parse_chunk(
             });
         }
         Kind::Click => {
-            let mut fields = [None; 4];
-            for_each_line(bytes_of(&click_maps[chunk.file]), chunk.start, chunk.end, |line, _| {
-                if !parse_line(line, &mut fields) {
-                    return;
-                }
+            for_each_record::<4>(bytes_of(&click_maps[chunk.file]), chunk.start, chunk.end, |fields, _| {
                 // Steps 2-3. Dedup is skipped: copies of a click have identical values, so a
                 // duplicate can change neither the credited click nor the set of assisting
                 // campaigns (rules.md Clicks step 2).
-                let [Some(click_id), Some(user), Some(campaign), Some(ts)] = fields else { return };
+                let [Some(click_id), Some(user), Some(campaign), Some(ts)] = *fields else { return };
                 let Some(&campaign) = context.campaigns.get(&key_of(campaign, None)) else { return };
                 let Some(ts) = ts::parse_cached(ts, &mut state.dates) else { return };
                 if ts < start_ms || ts >= end_ms {

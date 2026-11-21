@@ -44,6 +44,19 @@ fn short_bytes(key: Key) -> Vec<u8> {
 /// The key of a non-empty ID. `remember` stores a long ID's bytes for later.
 #[inline]
 pub fn key_of(id: &[u8], longs: Option<&LongIds>) -> Key {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+    if id.len() <= 15 {
+        // Same key as the scalar path: one fault-suppressing masked load of the ID's bytes,
+        // the length into byte 15, then a byte reversal so byte 0 is most significant.
+        use std::arch::x86_64::*;
+        // SAFETY: the masked load reads only id[..len]; avx512bw/avx512vl are enabled.
+        return unsafe {
+            let v = _mm_maskz_loadu_epi8(((1u32 << id.len()) - 1) as u16, id.as_ptr().cast());
+            let v = _mm_mask_set1_epi8(v, 1 << 15, id.len() as i8);
+            let reversed = _mm_shuffle_epi8(v, _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15));
+            std::mem::transmute::<__m128i, u128>(reversed)
+        };
+    }
     if id.len() <= 15 {
         let mut buffer = [0u8; 16];
         buffer[..id.len()].copy_from_slice(id);
@@ -90,6 +103,24 @@ mod tests {
                 assert_eq!(cmp(key_of(a, None), key_of(b, None), &longs), a.cmp(b), "{a:?} {b:?}");
             }
             assert_eq!(longs.bytes(key_of(a, None)), a);
+        }
+    }
+
+    #[test]
+    fn simd_packing_equals_portable_packing() {
+        let portable = |id: &[u8]| {
+            let mut buffer = [0u8; 16];
+            buffer[..id.len()].copy_from_slice(id);
+            buffer[15] = id.len() as u8;
+            u128::from_be_bytes(buffer)
+        };
+        let mut ids: Vec<Vec<u8>> = vec![b"a".to_vec(), b"\0".to_vec(), b"A\tB".to_vec(), "\u{ff12}x".as_bytes().to_vec()];
+        for n in 1..=15u8 {
+            ids.push((0..n).map(|i| b'a' + (i * 7 % 26)).collect());
+            ids.push((0..n).map(|i| 0x80 | i).collect());
+        }
+        for id in ids {
+            assert_eq!(key_of(&id, None), portable(&id), "{id:?}");
         }
     }
 

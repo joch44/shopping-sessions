@@ -44,6 +44,106 @@ pub fn parse_line<'a, const N: usize>(line: &'a [u8], out: &mut [Option<&'a [u8]
     count == N
 }
 
+/// Calls `f(fields, offset)` for every well-formed data line that STARTS in `start..end`
+/// (a line belongs to the chunk holding its first byte). The file's first line (the
+/// header, starting at 0) is skipped; only `\n` ends a line; malformed lines are dropped.
+///
+/// With AVX-512BW, each line is split with three 128-byte compare masks (`\n`, `,`, `"`)
+/// from masked loads, which never touch bytes past the end of `data`. A line of 128
+/// bytes or more takes the scalar `parse_line`; both paths accept exactly the same lines.
+#[inline]
+pub fn for_each_record<'a, const N: usize>(
+    data: &'a [u8],
+    start: usize,
+    end: usize,
+    mut f: impl FnMut(&[Option<&'a [u8]>; N], usize),
+) {
+    let first = if start == 0 { memchr::memchr(b'\n', data) } else { memchr::memchr(b'\n', &data[start - 1..]).map(|i| i + start - 1) };
+    let Some(newline) = first else { return };
+    let mut pos = newline + 1;
+    let mut fields: [Option<&'a [u8]>; N] = [None; N];
+    while pos < end && pos < data.len() {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+        {
+            let remaining = data.len() - pos;
+            // SAFETY: masked loads read only bytes in pos..data.len(); avx512bw is enabled.
+            let (newlines, commas, quotes) = unsafe { masks128(data.as_ptr().add(pos), remaining) };
+            if newlines != 0 || remaining < 128 {
+                let n = if newlines != 0 { newlines.trailing_zeros() as usize } else { remaining };
+                let line_start = pos;
+                pos += n + 1;
+                if n > 0 && split_masked(&data[line_start..line_start + n], commas, quotes, &mut fields) {
+                    f(&fields, line_start);
+                }
+                continue;
+            }
+            // A line of 128+ bytes: fall through to the scalar path.
+        }
+        let line_end = memchr::memchr(b'\n', &data[pos..]).map_or(data.len(), |i| pos + i);
+        if parse_line(&data[pos..line_end], &mut fields) {
+            f(&fields, pos);
+        }
+        pos = line_end + 1;
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+#[inline(always)]
+unsafe fn masks128(p: *const u8, remaining: usize) -> (u128, u128, u128) {
+    use std::arch::x86_64::*;
+    let lo_mask: u64 = if remaining >= 64 { u64::MAX } else { (1u64 << remaining) - 1 };
+    let hi_mask: u64 = if remaining >= 128 { u64::MAX } else if remaining > 64 { (1u64 << (remaining - 64)) - 1 } else { 0 };
+    unsafe {
+        let lo = _mm512_maskz_loadu_epi8(lo_mask, p.cast());
+        let hi = _mm512_maskz_loadu_epi8(hi_mask, p.add(64).cast());
+        let eq = |byte: u8| {
+            let x = _mm512_set1_epi8(byte as i8);
+            u128::from(_mm512_mask_cmpeq_epi8_mask(lo_mask, lo, x)) | u128::from(_mm512_mask_cmpeq_epi8_mask(hi_mask, hi, x)) << 64
+        };
+        (eq(b'\n'), eq(b','), eq(b'"'))
+    }
+}
+
+/// Fields of one line (n = line.len() < 128 bytes, no `\n`) from its comma and quote masks;
+/// the same rules as `parse_line`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+#[inline(always)]
+fn split_masked<'a, const N: usize>(line: &'a [u8], commas: u128, quotes: u128, out: &mut [Option<&'a [u8]>; N]) -> bool {
+    let n = line.len();
+    let in_line = (1u128 << n) - 1;
+    let mut commas = commas & in_line;
+    if commas.count_ones() as usize != N - 1 {
+        return false;
+    }
+    let quotes = quotes & in_line;
+    let mut field_start = 0usize;
+    for (i, slot) in out.iter_mut().enumerate() {
+        let field_end = if i + 1 < N {
+            let at = commas.trailing_zeros() as usize;
+            commas &= commas - 1;
+            at
+        } else {
+            n
+        };
+        let (mut a, mut b) = (field_start, field_end);
+        if quotes != 0 {
+            let in_field = ((1u128 << field_end) - 1) & !((1u128 << field_start) - 1);
+            let q = quotes & in_field;
+            if q != 0 {
+                // Quotes are allowed only as the first and last byte of the whole field.
+                if b - a < 2 || q != (1u128 << a | 1u128 << (b - 1)) {
+                    return false;
+                }
+                a += 1;
+                b -= 1;
+            }
+        }
+        *slot = if a == b { None } else { Some(&line[a..b]) };
+        field_start = field_end + 1;
+    }
+    true
+}
+
 /// Every data line of one file's bytes: the first line is skipped; the text
 /// after the final `\n` (if any) is the last line.
 pub fn data_lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
@@ -80,6 +180,39 @@ mod tests {
         assert_eq!(lines(b"h\n\n"), vec![b"" as &[u8]]);
         assert_eq!(lines(b"h\na\n\nb\n"), vec![b"a" as &[u8], b"", b"b"]);
         assert_eq!(lines(b"h\na\r\n"), vec![b"a\r" as &[u8]]);
+    }
+
+    #[test]
+    fn records_match_scalar_lines() {
+        let lines: Vec<&[u8]> = vec![
+            b"a,b,c", b"\"a\",,\"\"", b"a,b", b"a,b,c,d", b"a,b\"x\",c", b"a,\",c", b"a,\"\"\",c", b"",
+            b"x\r,y ,\" z\"", b",,", b"\"\",\"\",\"\"", b"\"a,b,c", b"a,b,c\"",
+        ];
+        let long = [b'x'; 200];
+        let mut long_line = long.to_vec();
+        long_line.extend_from_slice(b",y,z");
+        let mut all = lines.clone();
+        all.push(&long_line);
+        for last_newline in [true, false] {
+            let mut file = b"header\n".to_vec();
+            for line in &all {
+                file.extend_from_slice(line);
+                file.push(b'\n');
+            }
+            if !last_newline {
+                file.pop();
+            }
+            let mut expected = Vec::new();
+            let mut fields = [None; 3];
+            for line in data_lines(&file) {
+                if parse_line(line, &mut fields) {
+                    expected.push(fields.map(|f| f.map(<[u8]>::to_vec)));
+                }
+            }
+            let mut got = Vec::new();
+            for_each_record::<3>(&file, 0, file.len(), |fields, _| got.push(fields.map(|f| f.map(<[u8]>::to_vec))));
+            assert_eq!(got, expected, "last_newline={last_newline}");
+        }
     }
 
     #[test]
