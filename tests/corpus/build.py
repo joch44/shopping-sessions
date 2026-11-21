@@ -349,6 +349,15 @@ case("top_category_byte_order_uppercase_first",
              ev("e2", "u1", T(3), kind="purchase", product="p2", price="400")],
      users=[("u1", D3, 1, 2, 800, "Zebra")], campaigns=[ORG(D3, 1, 1, 800)])
 
+case("top_category_with_300_categories",
+     "products.csv has 300 distinct categories (more than fit in 8 bits): p300 (cat300) is index 299; u1 buys "
+     "p300 for 500 and p2 (cat002) for 400, so cat300 is the top category; u2 views p299",
+     products=tuple((f"p{n}", f"cat{n:03d}") for n in range(1, 301)),
+     events=[ev("e1", "u1", T(3, "10:00:00"), kind="purchase", product="p300", price="500"),
+             ev("e2", "u1", T(3, "10:05:00"), kind="purchase", product="p2", price="400"),
+             ev("e3", "u2", T(3), product="p299")],
+     users=[("u1", D3, 1, 2, 900, "cat300"), ("u2", D3, 1, 1, 0, "")], campaigns=[ORG(D3, 2, 1, 900)])
+
 # ============================================================== linked IDs
 
 CHAIN = [f"x{n:03d}" for n in range(500)]
