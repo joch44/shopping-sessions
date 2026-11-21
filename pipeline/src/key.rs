@@ -12,7 +12,7 @@
 
 use std::cmp::Ordering;
 use std::cell::RefCell;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -30,14 +30,27 @@ pub fn is_long(key: Key) -> bool {
 /// seen-set and buffer, and `flush` (called at the end of each work unit) moves the new ones
 /// into 256 shards, one write lock per shard touched. Reads take a shard's read lock.
 pub struct LongIds {
-    shards: Vec<RwLock<FxHashMap<Key, Box<[u8]>>>>,
+    shards: Vec<RwLock<FxHashMap<Key, &'static [u8]>>>,
+    /// Deferred long IDs (event and click user/click IDs): closed per work unit, inserted into
+    /// `shards` by `build` once parsing is over. Never freed: `shards` points into them.
+    batches: Mutex<Vec<std::sync::Arc<Batch>>>,
+    /// How many of `batches` `build` has inserted so far.
+    built: Mutex<usize>,
+}
+
+/// One work unit's deferred long IDs, ordered by shard: entries of shard s are
+/// `entries[starts[s]..starts[s + 1]]`, as (key, start, len) into `bytes`.
+struct Batch {
+    entries: Vec<(Key, u32, u32)>,
+    starts: Vec<u32>,
+    bytes: Box<[u8]>,
 }
 
 const SHARD_BITS: u32 = 8;
 
 impl Default for LongIds {
     fn default() -> Self {
-        Self { shards: (0..1 << SHARD_BITS).map(|_| RwLock::new(FxHashMap::default())).collect() }
+        Self { shards: (0..1 << SHARD_BITS).map(|_| RwLock::new(FxHashMap::default())).collect(), batches: Mutex::new(Vec::new()), built: Mutex::new(0) }
     }
 }
 
@@ -58,7 +71,20 @@ struct Local {
 
 thread_local! {
     static LOCAL: RefCell<Local> = RefCell::new(Local::default());
+    static DEFER: RefCell<Defer> = RefCell::new(Defer::default());
 }
+
+/// This thread's deferred long IDs. `recent` is a direct-mapped filter of keys already taken
+/// (a cheap stand-in for a seen-set: a miss only costs a duplicate entry, removed in `build`).
+#[derive(Default)]
+struct Defer {
+    owner: usize,
+    recent: Vec<Key>,
+    entries: Vec<(Key, u32, u32)>,
+    bytes: Vec<u8>,
+}
+
+const RECENT_BITS: u32 = 16;
 
 impl LongIds {
     #[inline]
@@ -88,15 +114,124 @@ impl LongIds {
             }
             let Local { pending, bytes, .. } = &mut *local;
             pending.sort_unstable_by_key(|&(key, _, _)| shard_of(key));
+            let stable: &'static [u8] = Box::leak(std::mem::take(bytes).into_boxed_slice());
             for run in pending.chunk_by(|a, b| shard_of(a.0) == shard_of(b.0)) {
                 let mut shard = self.shards[shard_of(run[0].0)].write().unwrap();
                 for &(key, start, len) in run {
-                    shard.entry(key).or_insert_with(|| bytes[start as usize..(start + len) as usize].into());
+                    shard.entry(key).or_insert(&stable[start as usize..(start + len) as usize]);
                 }
             }
             pending.clear();
             bytes.clear();
         });
+    }
+
+    /// Records a long ID for `build` (no shared state touched per occurrence). `filter`: skip
+    /// keys in the recent-keys filter (worth it for IDs that repeat, like user IDs; not for
+    /// click IDs, which occur about once each).
+    #[inline]
+    fn defer(&self, key: Key, id: &[u8], filter: bool) {
+        DEFER.with(|d| {
+            let mut d = d.borrow_mut();
+            let me = self as *const Self as usize;
+            if d.owner != me {
+                *d = Defer { owner: me, recent: vec![0; 1 << RECENT_BITS], ..Defer::default() };
+            }
+            if filter {
+                let slot = ((key >> 8) as usize) & ((1 << RECENT_BITS) - 1);
+                if d.recent[slot] == key {
+                    return;
+                }
+                d.recent[slot] = key;
+            }
+            let start = d.bytes.len() as u32;
+            d.bytes.extend_from_slice(id);
+            d.entries.push((key, start, id.len() as u32));
+        });
+    }
+
+    /// Records a person's name read in sessions (one per person: no filter).
+    pub fn defer_name(&self, key: Key, id: &[u8]) {
+        self.defer(key, id, false);
+    }
+
+    /// Ends a work unit: this thread's deferred IDs become one batch (call where `flush` is called).
+    pub fn close_unit(&self) {
+        let batch = DEFER.with(|d| {
+            let mut d = d.borrow_mut();
+            if d.owner != self as *const Self as usize || d.entries.is_empty() {
+                return None;
+            }
+            let mut entries = std::mem::take(&mut d.entries);
+            let bytes = std::mem::take(&mut d.bytes).into_boxed_slice();
+            entries.sort_unstable_by_key(|&(key, _, _)| shard_of(key));
+            let mut starts = vec![0u32; (1 << SHARD_BITS) + 1];
+            for &(key, _, _) in &entries {
+                starts[shard_of(key) + 1] += 1;
+            }
+            for s in 0..1 << SHARD_BITS {
+                starts[s + 1] += starts[s];
+            }
+            Some(Batch { entries, starts, bytes })
+        });
+        if let Some(b) = batch {
+            self.batches.lock().unwrap().push(std::sync::Arc::new(b));
+        }
+    }
+
+    /// Inserts the deferred long IDs closed so far (and not yet built) into the shared shards,
+    /// one shard per task across `threads` threads (each shard's map is small and stays in
+    /// cache). Call before anything reads deferred IDs: after link parsing (link IDs) and
+    /// after event and click parsing. Other threads may keep closing units meanwhile.
+    pub fn build(&self, threads: usize) {
+        let mut built = self.built.lock().unwrap();
+        let batches: Vec<std::sync::Arc<Batch>> = {
+            let all = self.batches.lock().unwrap();
+            let new = all[*built..].to_vec();
+            *built = all.len();
+            new
+        };
+        if batches.is_empty() {
+            return;
+        }
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..threads.max(1) {
+                scope.spawn(|| loop {
+                    let s = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if s >= 1 << SHARD_BITS {
+                        break;
+                    }
+                    let mut shard = self.shards[s].write().unwrap();
+                    for b in batches.iter() {
+                        for &(key, start, len) in &b.entries[b.starts[s] as usize..b.starts[s + 1] as usize] {
+                            // SAFETY: batches are never dropped or modified while `self` lives.
+                            let v: &'static [u8] = unsafe { std::slice::from_raw_parts(b.bytes.as_ptr().add(start as usize), len as usize) };
+                            shard.entry(key).or_insert(v);
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /// A long ID's bytes, without copying (empty if unknown, like `bytes`).
+    pub fn slice(&self, key: Key) -> &'static [u8] {
+        if let Some(&b) = self.shards[shard_of(key)].read().unwrap().get(&key) {
+            return b;
+        }
+        self.flush();
+        self.shards[shard_of(key)].read().unwrap().get(&key).copied().unwrap_or_default()
+    }
+
+    /// Appends the ID's bytes to `out` without allocating (output writer).
+    pub fn append_bytes(&self, key: Key, out: &mut Vec<u8>) {
+        if is_long(key) {
+            out.extend_from_slice(self.slice(key));
+        } else {
+            let bytes = key.to_be_bytes();
+            out.extend_from_slice(&bytes[..bytes[15] as usize]);
+        }
     }
 
     pub fn bytes(&self, key: Key) -> Vec<u8> {
@@ -147,12 +282,39 @@ pub fn key_of(id: &[u8], longs: Option<&LongIds>) -> Key {
     }
 }
 
+/// `key_of` for IDs whose bytes are only read after parsing (event and click IDs): a long
+/// ID is deferred instead of noted, and readable only after `LongIds::build`.
+#[inline]
+pub fn key_of_deferred(id: &[u8], longs: &LongIds) -> Key {
+    if id.len() <= 15 {
+        return key_of(id, None);
+    }
+    let key = (xxhash_rust::xxh3::xxh3_128(id) << 8) | Key::from(LONG);
+    longs.defer(key, id, true);
+    key
+}
+
+/// `key_of_deferred` for IDs that occur about once each (click IDs): no recent-keys filter.
+#[inline]
+pub fn key_of_deferred_once(id: &[u8], longs: &LongIds) -> Key {
+    if id.len() <= 15 {
+        return key_of(id, None);
+    }
+    let key = (xxhash_rust::xxh3::xxh3_128(id) << 8) | Key::from(LONG);
+    longs.defer(key, id, false);
+    key
+}
+
 /// Byte-wise order of the IDs behind two keys.
 pub fn cmp(a: Key, b: Key, longs: &LongIds) -> Ordering {
     if !is_long(a) && !is_long(b) {
         a.cmp(&b)
     } else {
-        longs.bytes(a).cmp(&longs.bytes(b))
+        // No allocation: a short key's bytes come from the key itself, a long one's from the table.
+        let (sa, sb) = (a.to_be_bytes(), b.to_be_bytes());
+        let x: &[u8] = if is_long(a) { longs.slice(a) } else { &sa[..sa[15] as usize] };
+        let y: &[u8] = if is_long(b) { longs.slice(b) } else { &sb[..sb[15] as usize] };
+        x.cmp(y)
     }
 }
 

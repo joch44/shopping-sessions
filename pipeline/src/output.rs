@@ -93,7 +93,7 @@ fn bytes(value: &[u8]) -> ByteArray {
 pub fn write_user_daily_fast(
     path: &Path,
     rows: &[UserRow],
-    name: &impl Fn(Key) -> Vec<u8>,
+    name: &impl Fn(Key, &mut Vec<u8>),
     categories: &[Vec<u8>],
 ) -> Result<()> {
     let mut names = Vec::with_capacity(rows.len() * 10);
@@ -102,7 +102,7 @@ pub fn write_user_daily_fast(
     let mut top_ends = Vec::new();
     let mut present = Vec::with_capacity(rows.len());
     for row in rows {
-        names.extend_from_slice(&name(row.person));
+        name(row.person, &mut names);
         name_ends.push(names.len() as u32);
         match row.top_category {
             Some(category) => {
@@ -114,7 +114,12 @@ pub fn write_user_daily_fast(
         }
     }
     if names.len() + 4 * rows.len() > pqw::MAX_PAGE || tops.len() + 5 * rows.len() > pqw::MAX_PAGE {
-        return write_user_daily(path, rows, name, categories);
+        let owned = |key: Key| {
+            let mut v = Vec::new();
+            name(key, &mut v);
+            v
+        };
+        return write_user_daily(path, rows, &owned, categories);
     }
     let days: Vec<i32> = rows.iter().map(|r| r.day).collect();
     let sessions: Vec<i64> = rows.iter().map(|r| r.sessions as i64).collect();

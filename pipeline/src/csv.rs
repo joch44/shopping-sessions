@@ -77,7 +77,20 @@ pub fn for_each_record<'a, const N: usize>(
                 }
                 continue;
             }
-            // A line of 128+ bytes: fall through to the scalar path.
+            // A line of 128..256 bytes (36-byte UUID IDs give ~136-byte event lines): masks
+            // for the next 128 bytes, then the same split rules over 256-bit masks.
+            // SAFETY: as above, masks128 reads only bytes in pos + 128..data.len().
+            let (newlines2, commas2, quotes2) = unsafe { masks128(data.as_ptr().add(pos + 128), remaining - 128) };
+            if newlines2 != 0 {
+                let n = 128 + newlines2.trailing_zeros() as usize;
+                let line_start = pos;
+                pos += n + 1;
+                if split_wide(&data[line_start..line_start + n], [commas, commas2], [quotes, quotes2], &mut fields) {
+                    f(&fields, line_start);
+                }
+                continue;
+            }
+            // A line of 256+ bytes: fall through to the scalar path.
         }
         let line_end = memchr::memchr(b'\n', &data[pos..]).map_or(data.len(), |i| pos + i);
         if parse_line(&data[pos..line_end], &mut fields) {
@@ -187,6 +200,45 @@ fn split_masked<'a, const N: usize>(line: &'a [u8], commas: u128, quotes: u128, 
         field_start = field_end + 1;
     }
     ok
+}
+
+/// Fields of one line of 128..256 bytes (no `\n`) from its comma and quote masks, as two
+/// 128-bit words each; the same accept/reject and values as `parse_line`. A field is quoted
+/// when it has 2+ bytes with a quote at both ends; the line is well-formed when the commas
+/// number N - 1 and every quote in it is one of those (popcount check), which is exactly
+/// parse_line's rule (a quote elsewhere, a lone `"` field, or a quote at one end only all
+/// leave an uncounted quote).
+#[cfg(all(target_arch = "x86_64", any(target_feature = "avx512bw", target_feature = "avx2"), target_feature = "bmi2"))]
+#[inline(always)]
+fn split_wide<'a, const N: usize>(line: &'a [u8], commas: [u128; 2], quotes: [u128; 2], out: &mut [Option<&'a [u8]>; N]) -> bool {
+    let n = line.len();
+    debug_assert!((128..256).contains(&n));
+    let in_hi = (1u128 << (n - 128)) - 1;
+    let mut c = [commas[0], commas[1] & in_hi];
+    let q = [quotes[0], quotes[1] & in_hi];
+    if (c[0].count_ones() + c[1].count_ones()) as usize != N - 1 {
+        return false;
+    }
+    let quote_at = |at: usize| (q[at >> 7] >> (at & 127)) & 1 == 1;
+    let mut counted = 0u32;
+    let mut field_start = 0usize;
+    for (i, slot) in out.iter_mut().enumerate() {
+        let field_end = if i + 1 < N {
+            let w = usize::from(c[0] == 0);
+            let at = (w << 7) + c[w].trailing_zeros() as usize;
+            c[w] &= c[w] - 1;
+            at
+        } else {
+            n
+        };
+        let quoted = field_end - field_start >= 2 && quote_at(field_start) && quote_at(field_end - 1);
+        let (a, b) = if quoted { (field_start + 1, field_end - 1) } else { (field_start, field_end) };
+        counted += 2 * u32::from(quoted);
+        // SAFETY: field_start <= a <= b <= field_end <= n.
+        *slot = if a == b { None } else { Some(unsafe { line.get_unchecked(a..b) }) };
+        field_start = field_end + 1;
+    }
+    counted == q[0].count_ones() + q[1].count_ones()
 }
 
 /// Without BMI2 (never the case for cascadelake builds): v11's per-field quote check.
@@ -311,5 +363,78 @@ mod tests {
         assert!(!parse_line(b"a,\",c", &mut out));
         assert!(!parse_line(b"a,\"\"\",c", &mut out));
         assert!(!parse_line(b"", &mut out));
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64", any(target_feature = "avx512bw", target_feature = "avx2"), target_feature = "bmi2"))]
+mod split_wide_tests {
+    use super::*;
+
+    fn masks(line: &[u8]) -> ([u128; 2], [u128; 2]) {
+        let (mut c, mut q) = ([0u128; 2], [0u128; 2]);
+        for (i, &b) in line.iter().enumerate() {
+            if b == b',' {
+                c[i >> 7] |= 1 << (i & 127);
+            }
+            if b == b'"' {
+                q[i >> 7] |= 1 << (i & 127);
+            }
+        }
+        (c, q)
+    }
+
+    #[test]
+    fn split_wide_matches_parse_line() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alphabet = b"ab0-_ \"\",,,\r\xc3\xbc";
+        let (mut accepted, mut total) = (0, 0);
+        for _ in 0..2_000_000 {
+            let n = 128 + (next() % 128) as usize;
+            // Mostly well-formed 7-field lines with random quoting, plus random noise.
+            let mut line = Vec::with_capacity(n);
+            if next() % 4 != 0 {
+                let mut fields: Vec<Vec<u8>> = (0..7).map(|_| (0..(next() % 40) as usize).map(|_| b"abcdef0123-_ \xc3"[(next() % 14) as usize]).collect()).collect();
+                for f in fields.iter_mut() {
+                    if next() % 3 == 0 {
+                        f.insert(0, b'"');
+                        f.push(b'"');
+                    }
+                    if next() % 50 == 0 {
+                        let at = (next() as usize) % (f.len() + 1);
+                        f.insert(at, b'"');
+                    }
+                }
+                line = fields.join(&b',');
+                while line.len() < 128 {
+                    line.insert(0, b'x');
+                }
+                line.truncate(255);
+            } else {
+                for _ in 0..n {
+                    line.push(alphabet[(next() % alphabet.len() as u64) as usize]);
+                }
+            }
+            if line.len() < 128 {
+                continue;
+            }
+            let (c, q) = masks(&line);
+            let mut a: [Option<&[u8]>; 7] = [None; 7];
+            let mut b: [Option<&[u8]>; 7] = [None; 7];
+            let ra = split_wide(&line, c, q, &mut a);
+            let rb = parse_line(&line, &mut b);
+            total += 1;
+            assert_eq!(ra, rb, "accept differs on {:?}", String::from_utf8_lossy(&line));
+            if ra {
+                accepted += 1;
+                assert_eq!(a, b, "fields differ on {:?}", String::from_utf8_lossy(&line));
+            }
+        }
+        eprintln!("split_wide: {accepted} of {total} lines accepted, all equal to parse_line");
     }
 }
