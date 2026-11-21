@@ -57,7 +57,7 @@ Mirror VM: 3.01 s @20M, 8.81 s @60M. All outputs match.
 | v17 | click person lookups batched (32) with prefetch | | | clicks 0.18 -> 0.13 s (mirror stage) |
 | v18 | hand-written Parquet writer (research Topic E), crate fallback > 1 GiB | 1.93 | 5.10 | clean interleaved vs v15: 2.00 / 5.41 |
 | v19 | dense campaign counters + 1024 person partitions (research, mirror-measured) | 1.78 | 4.97 | interleaved vs v18: 1.82 / 5.12 |
-| v20 | 16-byte per-person session events, 32-byte clicks | PENDING | | sessions 0.145 -> 0.130 s (analysis) |
+| v20 | 16-byte per-person session events, 32-byte clicks | 1.73 | 4.85 | interleaved vs v19: 1.76 / 4.89 |
 
 Calibration: v9 mirror 2.24 s vs grader 1.97 s -> factor 0.878 (tools/to_board.py). Target <1.0 s grader
 ~= 1.1 s mirror. Container start/stop floor ~0.34 s (research): in-process budget ~0.75 s @20M.
