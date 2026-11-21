@@ -538,6 +538,10 @@ struct Context {
     longs: LongIds,
     /// Packed event_ids travel as 32-byte EventCopy32 (category must fit 8 bits).
     compact: bool,
+    /// On the 64-byte path: persons with long IDs that no link names get their name from one of
+    /// their event lines in sessions, instead of recording every row's user_id. NAME_FROM_LINES=0
+    /// turns it off (also used by the rerun when a name cannot be read).
+    name_from_lines: bool,
 }
 
 
@@ -670,7 +674,13 @@ fn parse_chunk(
                 let id = key_of(event_id, None);
                 let seq = file_seq | offset as u64;
                 let copy = match judge(context, fields, ingest, &mut state.dates) {
-                    Some((user, ts, price, category)) => EventCopy { id, user: key_of_deferred(user, &context.longs), seq, ingest, ts, price, category },
+                    Some((user, ts, price, category)) => {
+                        // On the 64-byte path (compact off) a person's name is read once from one of
+                        // its event lines in sessions (via `seq`), not recorded per row. On the compact
+                        // path these side copies mix with packed ones, so they keep recording.
+                        let user = if context.name_from_lines { key_of(user, None) } else { key_of_deferred(user, &context.longs) };
+                        EventCopy { id, user, seq, ingest, ts, price, category }
+                    }
                     None => EventCopy { id, user: 0, seq, ingest, ts: 0, price: INVALID, category: 0 },
                 };
                 state.events.push(dedup_partition(id), copy);
@@ -730,7 +740,9 @@ fn flush_clicks(people: &People, pending: &mut Vec<(Key, Click)>, out: &mut Bloc
 /// The table holds (32-bit hash << 32 | copy index), so a probe compares hashes and only
 /// touches a record when they match (in practice only real duplicates). Winners are marked
 /// per copy and emitted in record order: both passes over the records are sequential.
-fn dedup(pieces: Vec<&[EventCopy]>, people: &People, scratch: &mut DedupScratch, out: &mut BlockScatter<Event>) {
+/// `seqs`: on the 64-byte path, each survivor's line (file and offset) in step with `out`, for
+/// naming its person in sessions.
+fn dedup(pieces: Vec<&[EventCopy]>, people: &People, scratch: &mut DedupScratch, out: &mut BlockScatter<Event>, mut seqs: Option<&mut BlockScatter<u64>>) {
     let total: usize = pieces.iter().map(|piece| piece.len()).sum();
     assert!(total < u32::MAX as usize, "dedup partition over 4G copies");
     let starts: Vec<usize> = pieces.iter().scan(0, |at, piece| { let start = *at; *at += piece.len(); Some(start) }).collect();
@@ -794,6 +806,9 @@ fn dedup(pieces: Vec<&[EventCopy]>, people: &People, scratch: &mut DedupScratch,
         let copy = &survivors[at];
         let person = people.get(copy.user);
         out.push(person_partition(person), Event { person, ts: copy.ts, price: copy.price, category: copy.category });
+        if let Some(seqs) = seqs.as_deref_mut() {
+            seqs.push(person_partition(person), copy.seq);
+        }
     }
 }
 
@@ -804,6 +819,10 @@ struct DedupScratch {
     survivors: Vec<EventCopy>,
     survivors32: Vec<(Key, u32, u32)>, // (user key, ts after window_start, price_cat)
 }
+
+/// Set when sessions could not read a person's name from its event line (never expected): the
+/// run then starts over with per-row recording (PIPE_LEGACY path with NAME_FROM_LINES=0).
+static NAME_MISSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Set when two packed copies of one event_id tie on ingest_ts but differ (see dedup32).
 static TIE_CONFLICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1161,6 +1180,24 @@ fn person_sessions<T: TsOffset>(person: Key, ts_rel: &[T], purchases: &[Purchase
 /// `person_sessions`. Clicks of a person with no surviving events can credit nothing.
 /// Reads the per-thread pieces in place; all temporary vectors live in `state.scratch`
 /// and are reused across partitions.
+/// Where sessions find the name of a person with a long ID that no link names: on the 64-byte
+/// path, each event's line (`seq_pieces`, in step with the event pieces) in `event_maps`.
+struct Names<'a> {
+    seq_pieces: Vec<&'a [u64]>,
+    event_maps: &'a [Option<Mmap>],
+}
+
+impl Names<'_> {
+    /// The user_id field of the event line at `seq` (file << 40 | byte offset of the line).
+    fn user_at(&self, seq: u64) -> Option<&[u8]> {
+        let data = bytes_of(self.event_maps.get((seq >> 40) as usize)?);
+        let start = (seq & ((1 << 40) - 1)) as usize;
+        let end = memchr::memchr(b'\n', data.get(start..)?).map_or(data.len(), |i| start + i);
+        let mut fields: [Option<&[u8]>; 7] = [None; 7];
+        if crate::csv::parse_line(&data[start..end], &mut fields) { fields[1] } else { None }
+    }
+}
+
 fn people_partition<T: TsOffset>(
     event_pieces: Vec<&[Event]>,
     click_pieces: Vec<&[Click]>,
@@ -1168,6 +1205,7 @@ fn people_partition<T: TsOffset>(
     state: &mut PeopleState,
     category_names: &[Vec<u8>],
     window_start: i64,
+    names: &Names,
 ) {
     let total: usize = event_pieces.iter().map(|piece| piece.len()).sum();
     if total == 0 {
@@ -1198,12 +1236,24 @@ fn people_partition<T: TsOffset>(
     // -0.043 s @60M).
     keyed.clear();
     keyed_purchases.clear();
+    let mut seqs = names.seq_pieces.iter().copied().flatten();
     for event in event_pieces.iter().copied().flatten() {
+        let seq = seqs.next();
         let group = match find(table, group_keys, event.person) {
             (_, Some(group)) => group,
             (slot, None) => {
                 table[slot] = group_keys.len() as u32;
                 group_keys.push(event.person);
+                // A person with a long ID that no link names is named by this event's own
+                // user_id (an unlinked person's events all carry that one ID): read it once.
+                if let Some(seq) = seq {
+                    if crate::key::is_long(event.person) && longs.slice(event.person).is_empty() {
+                        match names.user_at(*seq) {
+                            Some(id) if key_of(id, None) == event.person => longs.defer_name(event.person, id),
+                            _ => NAME_MISSING.store(true, Ordering::Relaxed),
+                        }
+                    }
+                }
                 (group_keys.len() - 1) as u32
             }
         };
@@ -1377,7 +1427,8 @@ fn run() -> Result<()> {
         && window.1.saturating_sub(window.0) < (1i64 << 32)
         && std::env::var_os("PIPE_LEGACY").is_none()
         && mostly_packable(&event_maps);
-    let context = Context { window, products, unknown_category, campaigns, longs: LongIds::default(), compact };
+    let name_from_lines = !compact && std::env::var("NAME_FROM_LINES").as_deref() != Ok("0");
+    let context = Context { window, products, unknown_category, campaigns, longs: LongIds::default(), compact, name_from_lines };
 
     // A+B. Task 0 resolves links while the other threads parse events (largest chunks
     // first). resolve_people fans its phases out over `threads` workers of its own, so links
@@ -1461,17 +1512,22 @@ fn run() -> Result<()> {
         Ok("0") => false,
         _ => kernel_at_least(6, 4),
     };
+    // On the 64-byte path sessions read each unnamed person's ID from its event line, so the
+    // event files stay mapped until then.
+    let mut event_maps = Some(event_maps);
     if unmap_inputs {
-        let maps = (event_maps, click_maps, link_maps);
+        let events = if context.name_from_lines { None } else { event_maps.take() };
+        let maps = (events, click_maps, link_maps);
         std::thread::spawn(move || drop(maps));
     }
+    let event_maps_ref: &[Option<Mmap>] = event_maps.as_deref().unwrap_or(&[]);
 
     // C. dedup per event_id partition.
     let deduped = run_tasks(
         threads,
         dedup_parts,
-        || (DedupScratch::default(), BlockScatter::new(person_parts)),
-        |(scratch, out), p| {
+        || (DedupScratch::default(), BlockScatter::new(person_parts), BlockScatter::<u64>::new(if context.name_from_lines { person_parts } else { 0 })),
+        |(scratch, out, seqs), p| {
             let pieces32: Vec<&[EventCopy32]> = event32_parts.iter().flat_map(|scatter| scatter.pieces(p)).filter(|s| !s.is_empty()).collect();
             if !pieces32.is_empty() {
                 dedup32(pieces32, &people, &slow_users, context.window.0, scratch, out);
@@ -1485,11 +1541,11 @@ fn run() -> Result<()> {
             }
             let pieces: Vec<&[EventCopy]> = event_parts.iter().flat_map(|scatter| scatter.pieces(p)).filter(|s| !s.is_empty()).collect();
             if !pieces.is_empty() {
-                dedup(pieces, &people, scratch, out)
+                dedup(pieces, &people, scratch, out, if context.name_from_lines { Some(seqs) } else { None })
             }
         },
     );
-    let person_events: Vec<BlockScatter<Event>> = deduped.into_iter().map(|(_, out)| out).collect();
+    let (person_events, person_seqs): (Vec<BlockScatter<Event>>, Vec<BlockScatter<u64>>) = deduped.into_iter().map(|(_, out, seqs)| (out, seqs)).unzip();
     timer.mark("dedup");
     if TIE_CONFLICT.load(Ordering::Relaxed) {
         // Nothing has been written yet: start over on the exact path (same args, same env).
@@ -1521,15 +1577,33 @@ fn run() -> Result<()> {
         |state, at| {
             let q = order[at];
             let event_pieces: Vec<&[Event]> = person_events.iter().flat_map(|scatter| scatter.pieces(q)).filter(|s| !s.is_empty()).collect();
+            // In step with event_pieces (same pushes, same block sizes) on the 64-byte path.
+            let seq_pieces: Vec<&[u64]> = if !context.name_from_lines { Vec::new() } else { person_seqs.iter().flat_map(|scatter| scatter.pieces(q)).filter(|s| !s.is_empty()).collect() };
+            let names = Names { seq_pieces, event_maps: event_maps_ref };
             let click_pieces: Vec<&[Click]> = click_parts.iter().flat_map(|scatter| scatter.pieces(q)).filter(|s| !s.is_empty()).collect();
             // Every event ts lies in [window_start, window_end): u32 offsets fit when the window does.
             if context.window.1 - context.window.0 <= i64::from(u32::MAX) {
-                people_partition::<u32>(event_pieces, click_pieces, &context.longs, state, &category_names, context.window.0);
+                people_partition::<u32>(event_pieces, click_pieces, &context.longs, state, &category_names, context.window.0, &names);
             } else {
-                people_partition::<i64>(event_pieces, click_pieces, &context.longs, state, &category_names, context.window.0);
+                people_partition::<i64>(event_pieces, click_pieces, &context.longs, state, &category_names, context.window.0, &names);
             }
+            // Names read in this partition become one batch for the build below.
+            context.longs.close_unit();
         },
     );
+    // Names read from event lines become readable for output; then the event files can go.
+    context.longs.build(threads);
+    if NAME_MISSING.load(Ordering::Relaxed) {
+        // Nothing has been written yet: start over recording every row's user_id.
+        use std::os::unix::process::CommandExt;
+        eprintln!("pipeline: a person's name could not be read from its event line; rerunning with per-row names");
+        let error = std::process::Command::new(std::env::current_exe()?).args(std::env::args_os().skip(1)).env("NAME_FROM_LINES", "0").exec();
+        return Err(error.into());
+    }
+    if unmap_inputs {
+        let maps = event_maps.take();
+        std::thread::spawn(move || drop(maps));
+    }
     timer.mark("sessions + attribution");
 
     // E. output.

@@ -150,6 +150,11 @@ impl LongIds {
         });
     }
 
+    /// Records a person's name read in sessions (one per person: no filter).
+    pub fn defer_name(&self, key: Key, id: &[u8]) {
+        self.defer(key, id, false);
+    }
+
     /// Ends a work unit: this thread's deferred IDs become one batch (call where `flush` is called).
     pub fn close_unit(&self) {
         let batch = DEFER.with(|d| {
