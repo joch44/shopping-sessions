@@ -1924,16 +1924,17 @@ const fn cts_rows() -> [CtsRow; CTS_ROWS] {
         row.ctrl[14] = (src + b0 + 8) as u8;
         row.base[14] = b'+';
         row.lim[14] = 2;
-        row.w1[14] = -1;
+        row.w1[14] = 1;
         row.ctrl[15] = (src + b0 + 8) as u8;
-        row.base[15] = b',';
+        row.base[15] = b'-';
         row.lim[15] = 255;
-        row.w1[15] = -1;
+        row.w1[15] = 1;
         row.w2 = [60, 1, 60, 1, 60, 1, 0, 1];
-        row.limv = [1430, i32::MAX, 1439, -2];
+        row.limv = [1430, i32::MAX, 1439, 255];
         row.w3 = [0, 0, 0, 0, 60, 1, 1, 0];
         row.ksel = [0; 16];
-        row.ksel[14] = 2;
+        row.ksel[15] = 0x80;
+        row.kmf = [0, -60_000];
         assert!(old.kme[1] == 1000 && old.kmf[1] == 60_000 && old.koff1 == q as i64 && old.pmask == DATE_PEXT && old.ksel[8] == 2 && old.w3[4] == 60 && old.w3[6] == 60);
         t[r] = row;
         q += 1;
@@ -1942,21 +1943,33 @@ const fn cts_rows() -> [CtsRow; CTS_ROWS] {
 }
 static CTS: [CtsRow; CTS_ROWS] = cts_rows();
 
-const fn camp5_shapes() -> [DecShape; 128] {
-    let mut t = [DecShape { ctrl: [0x80; 16], subv: [0; 16], lz: [0; 16], _pad: [0; 16] }; 128];
-    let mut i = 0;
-    while i < 128 {
-        t[i].subv[8] = 1;
-        i += 1;
-    }
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct CampRow {
+    ctrl: [u8; 16],
+    subv: [u8; 16],
+    lim: [u8; 16],
+    _pad: [u8; 16],
+}
+const CAMPB_ROWS: usize = 320;
+const CAMPB_OFF: usize = 64 * 64;
+const fn campb_rows() -> [CampRow; CAMPB_ROWS] {
+    let mut bad = CampRow { ctrl: [0x80; 16], subv: [0; 16], lim: [0; 16], _pad: [0; 16] };
+    bad.subv[8] = 1;
+    let mut t = [bad; CAMPB_ROWS];
     let mut q = 0;
     while q < 2 {
         let mut nd = 1;
         while nd <= 4 {
             let raw = 2 + nd + 2 * q;
-            let mut s = DecShape { ctrl: [0x80; 16], subv: [0; 16], lz: [0; 16], _pad: [0; 16] };
+            let mut s = CampRow { ctrl: [0x80; 16], subv: [0; 16], lim: [0; 16], _pad: [0; 16] };
             let fs = 15 - raw;
             let ds = 15 - q - nd;
+            let mut j = 0;
+            while j < 4 {
+                s.lim[j] = 9;
+                j += 1;
+            }
             let mut j = 0;
             while j < nd {
                 s.ctrl[4 - nd + j] = (ds + j) as u8;
@@ -1975,35 +1988,131 @@ const fn camp5_shapes() -> [DecShape; 128] {
                 s.ctrl[12] = fs as u8;
                 s.subv[12] = b'"';
             }
+            s.ctrl[13] = (fs - 1) as u8;
+            s.subv[13] = b',';
             if nd > 1 {
-                s.lz[4 - nd] = 1;
+                s.ctrl[14] = ds as u8;
+                s.subv[14] = b'1';
+                s.lim[14] = 8;
             }
-            t[(raw + 1) * 2 + (1 - q)] = s;
+            let b = if q == 1 { b'"' } else { b'c' } as usize;
+            let idx = b + 64 - 2 * (raw + 1);
+            assert!(t[idx].subv[8] == 1);
+            t[idx] = s;
             nd += 1;
         }
         q += 1;
     }
     t
 }
-const fn camp5r_shapes() -> [DecShape; 66] {
-    let s = camp5_shapes();
-    let mut t = [s[0]; 66];
-    let mut r = 0;
-    while r <= 32 {
-        t[64 - 2 * r] = s[2 * r];
-        t[64 - 2 * r + 1] = s[2 * r + 1];
-        r += 1;
+static CAMPB: [CampRow; CAMPB_ROWS] = campb_rows();
+
+#[repr(C, align(128))]
+#[derive(Clone, Copy)]
+struct CjRow {
+    ctrl: [u8; 32],
+    subv: [u8; 32],
+    lz: [u8; 32],
+    _pad: [u8; 32],
+}
+const CJ_ROWS: usize = 34 * 32;
+const fn cj_rows() -> [CjRow; CJ_ROWS] {
+    let k = id_shapes_raw(b'k', 0, 8, false);
+    let u = id_shapes_raw(b'u', 0, 8, true);
+    let mut bad = CjRow { ctrl: [0x80; 32], subv: [0; 32], lz: [0; 32], _pad: [0; 32] };
+    bad.subv[8] = 1;
+    bad.subv[24] = 1;
+    let mut t = [bad; CJ_ROWS];
+    let mut c0 = 0;
+    while c0 < 32 {
+        let mut c1 = c0 + 1;
+        while c1 < 32 {
+            let d = c1 - c0 - 1;
+            let a = &k[c0];
+            let b = &u[d];
+            let r = &mut t[c0 * 32 + c1];
+            let mut i = 0;
+            while i < 16 {
+                r.ctrl[i] = a.ctrl[i];
+                r.subv[i] = a.subv[i];
+                r.lz[i] = a.lz[i];
+                i += 1;
+            }
+            if b.orv[1] == 0 && d <= 15 {
+                let mut i = 0;
+                while i < 16 {
+                    let c = b.ctrl[i];
+                    r.ctrl[16 + i] = if c == 0x80 {
+                        0x80
+                    } else {
+                        let n = c as i32 + d as i32 - 15;
+                        assert!(n >= 1 && n <= 15);
+                        n as u8
+                    };
+                    r.subv[16 + i] = b.subv[i];
+                    r.lz[16 + i] = b.lz[i];
+                    i += 1;
+                }
+            }
+            c1 += 1;
+        }
+        c0 += 1;
     }
     t
 }
-static CAMP5R: [DecShape; 66] = camp5r_shapes();
+static CJ: [CjRow; CJ_ROWS] = cj_rows();
+
+#[repr(C, align(64))]
+struct ClConst {
+    comma: [u8; 32],
+    nl: [u8; 32],
+    e: [u8; 32],
+    letlim: [u8; 32],
+    diglim: [u8; 32],
+    m39: [u8; 32],
+    w1: [u16; 16],
+    w2: [u32; 8],
+    w3: [u64; 4],
+    cw1: [u8; 16],
+    cw2: [u32; 4],
+    ksel: [u64; 2],
+}
+const fn cl_const() -> ClConst {
+    let mut c = ClConst { comma: [b','; 32], nl: [b'\n'; 32], e: [0; 32], letlim: [0; 32], diglim: [0; 32], m39: [217; 32], w1: [0x0124; 16], w2: [0x0001_0510; 8], w3: [1_679_616; 4], cw1: [0; 16], cw2: [0; 4], ksel: [0, 0x80 << 56] };
+    let mut i = 0;
+    while i < 32 {
+        if i % 16 < 8 {
+            c.e[i] = 207;
+            c.letlim[i] = 25;
+            c.diglim[i] = 9;
+        }
+        i += 1;
+    }
+    c.cw1 = [10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    c.cw2 = [0x0001_0064, 0, 0, 0];
+    c
+}
+static CLC: ClConst = cl_const();
+const _: () = assert!(
+    core::mem::size_of::<CjRow>() == 128
+        && core::mem::size_of::<CampRow>() == 64
+        && core::mem::offset_of!(ClConst, nl) == 32
+        && core::mem::offset_of!(ClConst, e) == 64
+        && core::mem::offset_of!(ClConst, letlim) == 96
+        && core::mem::offset_of!(ClConst, diglim) == 128
+        && core::mem::offset_of!(ClConst, m39) == 160
+        && core::mem::offset_of!(ClConst, w1) == 192
+        && core::mem::offset_of!(ClConst, w2) == 224
+        && core::mem::offset_of!(ClConst, w3) == 256
+        && core::mem::offset_of!(ClConst, cw1) == 288
+        && core::mem::offset_of!(ClConst, cw2) == 304
+        && core::mem::offset_of!(ClConst, ksel) == 320
+);
 
 const C_CAMP: usize = core::mem::offset_of!(CkBatch, camp);
 const C_CID: usize = core::mem::offset_of!(CkBatch, cid);
 const C_UID: usize = core::mem::offset_of!(CkBatch, uid);
 const C_SCR: usize = core::mem::offset_of!(CkBatch, scratch) - 512;
-const O_KID1: usize = core::mem::offset_of!(Tables, kid1);
-const O_UID1M: usize = core::mem::offset_of!(Tables, uid1) - 64;
 const _: () = assert!(
     core::mem::offset_of!(CkBatch, ts) == 0
         && core::mem::offset_of!(CkBatch, camp) == 512
@@ -2033,7 +2142,7 @@ const _: () = assert!(
 );
 
 macro_rules! cl_ms {
-    ($a:literal, $b:literal, $cin:literal, $nlin:literal, $cout:literal, $nlout:literal, $slot:literal, $row:literal, $x:literal, $days:literal, $bad:literal, $camp:literal, $ids:literal) => {
+    ($a:literal, $b:literal, $cin:literal, $nlin:literal, $cout:literal, $nlout:literal, $row:literal, $x:literal, $days:literal, $bad:literal, $badx:literal, $camp:literal, $ids:literal) => {
         concat!(
             "lea ", $a, ", [", $b, " + ", $nlin, " + 33]\n",
             "vpcmpeqb ymm0, ymm13, ymmword ptr [", $a, "]\n",
@@ -2042,53 +2151,41 @@ macro_rules! cl_ms {
             "vpmovmskb ", $nlout, ", ymm1\n",
             "tzcnt ", $nlout, ", ", $nlout, "\n",
             "prefetcht0 byte ptr [", $a, " + {PFD}]\n",
-            "mov qword ptr [rsp + ", $slot, "], ", $b, "\n",
             "tzcnt r8d, ", $cin, "\n",
             "blsr ", $cin, ", ", $cin, "\n",
             "tzcnt r9d, ", $cin, "\n",
             "blsr ", $cin, ", ", $cin, "\n",
             "tzcnt r10d, ", $cin, "\n",
-            "vmovdqu xmm3, xmmword ptr [", $b, " + r8 - 16]\n",
-            "vmovdqu xmm4, xmmword ptr [", $b, " + r9 - 16]\n",
+            "vmovdqu ymm3, ymmword ptr [", $b, " + r8 - 16]\n",
             "movzx edx, byte ptr [", $b, " + r9 + 1]\n",
             "vmovdqu xmm0, xmmword ptr [", $b, " + r10 - 15]\n",
-            "imul edi, r9d, 64\n",
+            "shl r8d, 12\n",
+            "imul edi, r9d, 128\n",
+            "add edi, r8d\n",
             "sub r9, r10\n",
-            "and edx, 1\n",
             "lea rdx, [rdx + r9*2]\n",
             "shl rdx, 6\n",
-            "vpshufb xmm0, xmm0, xmmword ptr [{CAMP} + rdx + 4096]\n",
-            "vpsubb xmm0, xmm0, xmmword ptr [{CAMP} + rdx + 4096 + 16]\n",
-            "vmovdqa xmm1, xmmword ptr [{CAMP} + rdx + 4096 + 32]\n",
-            "vpsubusb xmm1, xmm1, xmm0\n",
-            "vpsubusb xmm2, xmm0, xmm24\n",
+            "vpshufb xmm0, xmm0, xmmword ptr [{CB} + rdx + {CBO}]\n",
+            "vpsubb xmm0, xmm0, xmmword ptr [{CB} + rdx + {CBO} + 16]\n",
+            "vpsubusb xmm2, xmm0, xmmword ptr [{CB} + rdx + {CBO} + 32]\n",
             "vpmaddubsw xmm0, xmm0, xmm25\n",
             "vpmaddwd ", $camp, ", xmm0, xmm26\n",
-            "shl r8d, 6\n",
-            "sub edi, r8d\n",
-            "vpshufb xmm3, xmm3, xmmword ptr [{T} + r8 + {KID1}]\n",
-            "vpsubb xmm3, xmm3, xmmword ptr [{T} + r8 + {KID1} + 16]\n",
-            "vpshufb xmm4, xmm4, xmmword ptr [{T} + rdi + {UID1}]\n",
-            "vpsubb xmm4, xmm4, xmmword ptr [{T} + rdi + {UID1} + 16]\n",
-            "vpblendd xmm5, xmm3, xmm4, 12\n",
-            "vpblendd xmm3, xmm4, xmm3, 12\n",
-            "vpternlogq xmm3, xmm1, xmm2, 0xfe\n",
-            "vpaddb xmm4, xmm5, xmm16\n",
-            "vpsubusb xmm4, xmm4, xmm17\n",
-            "vpsubusb xmm6, xmm5, xmm18\n",
-            "vpminub xmm4, xmm6, xmm4\n",
-            "vpaddb xmm6, xmm5, xmm19\n",
-            "vpminub xmm5, xmm5, xmm6\n",
-            "vmovdqu xmm6, xmmword ptr [{T} + rdi + {UID1} + 32]\n",
-            "vpor xmm6, xmm6, xmmword ptr [{T} + r8 + {KID1} + 32]\n",
-            "vpsubusb xmm6, xmm6, xmm5\n",
-            "vpternlogq xmm3, xmm4, xmm6, 0xfe\n",
-            "vpmaddubsw xmm5, xmm5, xmm20\n",
-            "vpmaddwd xmm5, xmm5, xmm21\n",
-            "vpmuludq xmm1, xmm5, xmm22\n",
-            "vpsrlq xmm5, xmm5, 32\n",
-            "vpaddq xmm5, xmm1, xmm5\n",
-            "vporq ", $ids, ", xmm5, xmmword ptr [{T} + rdi + {UID1} + 48]\n",
+            "vpshufb ymm3, ymm3, ymmword ptr [{CJ} + rdi]\n",
+            "vpsubb ymm5, ymm3, ymmword ptr [{CJ} + rdi + 32]\n",
+            "vpaddb ymm4, ymm5, ymm16\n",
+            "vpsubusb ymm4, ymm4, ymm17\n",
+            "vpsubusb ymm6, ymm5, ymm18\n",
+            "vpminub ymm4, ymm4, ymm6\n",
+            "vpaddb ymm6, ymm5, ymm19\n",
+            "vpminub ymm5, ymm5, ymm6\n",
+            "vmovdqa ymm6, ymmword ptr [{CJ} + rdi + 64]\n",
+            "vpsubusb ymm6, ymm6, ymm5\n",
+            "vpternlogq ymm4, ymm6, ymm2, 0xfe\n",
+            "vpmaddubsw ymm5, ymm5, ymm20\n",
+            "vpmaddwd ymm5, ymm5, ymm21\n",
+            "vpmuludq ymm1, ymm5, ymm22\n",
+            "vpsrlq ymm5, ymm5, 32\n",
+            "vpaddq ", $ids, ", ymm1, ymm5\n",
             "lea rdx, [", $b, " + r10]\n",
             "sub r10, ", $nlin, "\n",
             "imul ", $row, ", r10, -256\n",
@@ -2096,16 +2193,16 @@ macro_rules! cl_ms {
             "movzx r9d, word ptr [rdx + 9]\n",
             "pext r9, r9, qword ptr [{CTS} + ", $row, " + 8192 + 184]\n",
             "shl r9d, 5\n",
-            "vmovdqu64 ", $bad, ", xmmword ptr [r15 + r9 + {SCR}]\n",
-            "vpxorq ", $bad, ", ", $bad, ", xmmword ptr [rdx]\n",
-            "vpternlogq ", $bad, ", xmm3, xmmword ptr [{CTS} + ", $row, " + 8192 + 112], 0xec\n",
+            "vmovdqu64 ", $badx, ", xmmword ptr [r15 + r9 + {SCR}]\n",
+            "vpxorq ", $badx, ", ", $badx, ", xmmword ptr [rdx]\n",
+            "vpternlogq ", $bad, ", ymm4, ymmword ptr [{CTS} + ", $row, " + 8192 + 112], 0xec\n",
             "vmovdqu64 ", $days, ", xmmword ptr [r15 + r9 + {SCR} + 16]\n",
             "vmovdqu64 ", $x, ", xmmword ptr [", $a, " - 17]\n",
         )
     };
 }
 macro_rules! cl_d {
-    ($badx:literal, $full:literal, $row:literal, $x:literal, $days:literal, $bad:literal, $camp:literal, $ids:literal) => {
+    ($o:literal, $lim:literal, $limx:literal, $row:literal, $x:literal, $days:literal, $bad:literal, $camp:literal, $idsx:literal, $uid:literal) => {
         concat!(
             "vpshufb xmm0, ", $x, ", xmmword ptr [{CTS} + ", $row, " + 8192]\n",
             "vpsubb xmm0, xmm0, xmmword ptr [{CTS} + ", $row, " + 8192 + 16]\n",
@@ -2113,24 +2210,21 @@ macro_rules! cl_d {
             "vpmaddwd xmm1, xmm1, xmmword ptr [{CTS} + ", $row, " + 8192 + 64]\n",
             "vpackusdw xmm2, xmm1, xmm1\n",
             "vpmaddwd xmm2, xmm2, xmmword ptr [{CTS} + ", $row, " + 8192 + 80]\n",
-            "vpsubusb xmm3, xmm0, xmmword ptr [{CTS} + ", $row, " + 8192 + 32]\n",
+            "vpsubusb ", $limx, ", xmm0, xmmword ptr [{CTS} + ", $row, " + 8192 + 32]\n",
             "vpcmpgtd xmm1, xmm1, xmmword ptr [{CTS} + ", $row, " + 8192 + 96]\n",
-            "vptestnmq k1, xmm0, xmmword ptr [{CTS} + ", $row, " + 8192 + 160]\n",
+            "vptestnmq k1, xmm0, xmm24\n",
             "vpmuludq xmm4, xmm2, xmmword ptr [{CTS} + ", $row, " + 8192 + 128]\n",
             "vpsrlq xmm2, xmm2, 32\n",
             "vpmuldq xmm2, xmm2, xmmword ptr [{CTS} + ", $row, " + 8192 + 144]\n",
             "vpsubq xmm2{{k1}}, xmm23, xmm2\n",
             "vpaddq xmm4, xmm4, ", $days, "\n",
             "vpaddq xmm4, xmm4, xmm2\n",
-            "vmovhps qword ptr [r15 + rbx], xmm4\n",
-            "vmovq qword ptr [r15 + rbx + {CAMPO}], ", $camp, "\n",
-            "vmovq qword ptr [r15 + rbx + {CIDO}], ", $ids, "\n",
-            "vmovhps qword ptr [r15 + rbx + {UIDO}], ", $ids, "\n",
-            "vpternlogq xmm3, xmm1, ", $bad, ", 0xfe\n",
-            "vptest xmm3, xmm3\n",
-            "jnz ", $badx, "\n",
-            "add rbx, 8\n",
-            "jz ", $full, "\n",
+            $uid, "\n",
+            "vmovhps qword ptr [r15 + rbx + ", $o, "], xmm4\n",
+            "vmovq qword ptr [r15 + rbx + ", $o, " + {CAMPO}], ", $camp, "\n",
+            "vmovq qword ptr [r15 + rbx + ", $o, " + {CIDO}], ", $idsx, "\n",
+            "vmovq qword ptr [r15 + rbx + ", $o, " + {UIDO}], xmm5\n",
+            "vpternlogq ", $lim, ", ymm1, ", $bad, ", 0xfe\n",
         )
     };
 }
@@ -2144,71 +2238,82 @@ unsafe fn cl_loop(p: *const u8, w: *mut i64, b512: *mut u8) -> (u64, *const u8, 
         core::arch::asm!(
             "push rbx",
             "push rbp",
-            "sub rsp, 16",
+            "sub rsp, 24",
             "mov r15, rdx",
             "mov rbx, rsi",
             "sub rbx, r15",
-            "mov rbp, rdi",
-            "mov eax, 0x2c2c2c2c",
-            "vmovd xmm13, eax",
-            "vpbroadcastd ymm13, xmm13",
-            "mov eax, 0x0a0a0a0a",
-            "vmovd xmm12, eax",
-            "vpbroadcastd ymm12, xmm12",
-            "mov eax, 0xcfcfcfcf",
-            "vpbroadcastd xmm16, eax",
-            "mov eax, 0x19191919",
-            "vpbroadcastd xmm17, eax",
-            "mov eax, 0x09090909",
-            "vpbroadcastd xmm18, eax",
-            "vmovd xmm0, eax",
-            "vmovdqa64 xmm24, xmm0",
-            "mov eax, 0xd9d9d9d9",
-            "vpbroadcastd xmm19, eax",
-            "mov eax, 0x01240124",
-            "vpbroadcastd xmm20, eax",
-            "mov eax, 0x00010510",
-            "vpbroadcastd xmm21, eax",
-            "mov eax, 1679616",
-            "vpbroadcastq xmm22, rax",
+            "vmovdqa ymm13, ymmword ptr [{K}]",
+            "vmovdqa ymm12, ymmword ptr [{K} + 32]",
+            "vmovdqa64 ymm16, ymmword ptr [{K} + 64]",
+            "vmovdqa64 ymm17, ymmword ptr [{K} + 96]",
+            "vmovdqa64 ymm18, ymmword ptr [{K} + 128]",
+            "vmovdqa64 ymm19, ymmword ptr [{K} + 160]",
+            "vmovdqa64 ymm20, ymmword ptr [{K} + 192]",
+            "vmovdqa64 ymm21, ymmword ptr [{K} + 224]",
+            "vmovdqa64 ymm22, ymmword ptr [{K} + 256]",
+            "vmovdqa64 xmm25, xmmword ptr [{K} + 288]",
+            "vmovdqa64 xmm26, xmmword ptr [{K} + 304]",
+            "vmovdqa64 xmm24, xmmword ptr [{K} + 320]",
             "vpxord xmm23, xmm23, xmm23",
-            "mov eax, 0x010a010a",
-            "vmovd xmm0, eax",
-            "vmovdqa64 xmm25, xmm0",
-            "mov eax, 0x00010064",
-            "vmovd xmm0, eax",
-            "vmovdqa64 xmm26, xmm0",
+            "vpxor xmm14, xmm14, xmm14",
+            "test bl, 8",
+            "jnz 70f",
+            "mov rbp, rdi",
+            "mov qword ptr [rsp + 16], rbp",
+            "mov qword ptr [rsp + 8], 1",
             "vpcmpeqb ymm0, ymm13, ymmword ptr [rbp]",
             "vpmovmskb eax, ymm0",
             "vpcmpeqb ymm1, ymm12, ymmword ptr [rbp + 32]",
             "vpmovmskb ecx, ymm1",
             "tzcnt ecx, ecx",
-            cl_ms!("r12", "rbp", "eax", "rcx", "r11d", "r13d", "0", "rsi", "xmm8", "xmm9", "xmm10", "xmm11", "xmm27"),
+            cl_ms!("r12", "rbp", "eax", "rcx", "r11d", "r13d", "rsi", "xmm8", "xmm9", "ymm10", "xmm10", "xmm11", "ymm27"),
+            "jmp 2f",
+            "70:",
+            "mov r12, rdi",
+            "mov qword ptr [rsp + 16], r12",
+            "sub rbx, 8",
+            "mov qword ptr [rsp + 8], rbx",
+            "vpcmpeqb ymm0, ymm13, ymmword ptr [r12]",
+            "vpmovmskb r11d, ymm0",
+            "vpcmpeqb ymm1, ymm12, ymmword ptr [r12 + 32]",
+            "vpmovmskb r13d, ymm1",
+            "tzcnt r13d, r13d",
+            cl_ms!("rbp", "r12", "r11d", "r13", "eax", "ecx", "r14", "xmm28", "xmm29", "ymm30", "xmm30", "xmm31", "ymm7"),
+            "jmp 3f",
             ".p2align 5",
             "2:",
-            cl_ms!("rbp", "r12", "r11d", "r13", "eax", "ecx", "8", "r14", "xmm28", "xmm29", "xmm30", "xmm31", "xmm7"),
-            cl_d!("92f", "82f", "rsi", "xmm8", "xmm9", "xmm10", "xmm11", "xmm27"),
-            cl_ms!("r12", "rbp", "eax", "rcx", "r11d", "r13d", "0", "rsi", "xmm8", "xmm9", "xmm10", "xmm11", "xmm27"),
-            cl_d!("93f", "83f", "r14", "xmm28", "xmm29", "xmm30", "xmm31", "xmm7"),
-            "jmp 2b",
-            "92:",
-            "mov rdi, qword ptr [rsp]",
-            "mov eax, 1",
-            "jmp 6f",
-            "93:",
-            "mov rdi, qword ptr [rsp + 8]",
-            "mov eax, 1",
-            "jmp 6f",
-            "82:",
-            "mov rdi, qword ptr [rsp + 8]",
+            cl_ms!("rbp", "r12", "r11d", "r13", "eax", "ecx", "r14", "xmm28", "xmm29", "ymm30", "xmm30", "xmm31", "ymm7"),
+            cl_d!("0", "ymm14", "xmm14", "rsi", "xmm8", "xmm9", "ymm10", "xmm11", "xmm27", "vextracti32x4 xmm5, ymm27, 1"),
+            "3:",
+            cl_ms!("r12", "rbp", "eax", "rcx", "r11d", "r13d", "rsi", "xmm8", "xmm9", "ymm10", "xmm10", "xmm11", "ymm27"),
+            cl_d!("8", "ymm3", "xmm3", "r14", "xmm28", "xmm29", "ymm30", "xmm31", "xmm7", "vextracti128 xmm5, ymm7, 1"),
+            "vpor ymm3, ymm3, ymm14",
+            "vptest ymm3, ymm3",
+            "jnz 90f",
+            "mov qword ptr [rsp + 16], rbp",
+            "add rbx, 16",
+            "jnz 2b",
+            "mov rdi, rbp",
             "mov eax, 2",
-            "jmp 6f",
-            "83:",
-            "mov rdi, qword ptr [rsp]",
-            "mov eax, 2",
-            "6:",
             "lea rsi, [r15 + rbx]",
-            "add rsp, 16",
+            "jmp 6f",
+            "90:",
+            "mov rdi, qword ptr [rsp + 16]",
+            "mov eax, 1",
+            "vptest ymm14, ymm14",
+            "jnz 91f",
+            "lea rsi, [r15 + rbx + 8]",
+            "cmp rbx, qword ptr [rsp + 8]",
+            "je 6f",
+            "vpcmpeqb ymm1, ymm12, ymmword ptr [rdi + 32]",
+            "vpmovmskb ecx, ymm1",
+            "tzcnt ecx, ecx",
+            "lea rdi, [rdi + rcx + 33]",
+            "jmp 6f",
+            "91:",
+            "lea rsi, [r15 + rbx]",
+            "6:",
+            "add rsp, 24",
             "pop rbp",
             "pop rbx",
             inout("rdi") p => np,
@@ -2217,12 +2322,12 @@ unsafe fn cl_loop(p: *const u8, w: *mut i64, b512: *mut u8) -> (u64, *const u8, 
             out("rax") code,
             out("rcx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _, out("r12") _, out("r13") _, out("r14") _, out("r15") _,
             out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _, out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
-            out("zmm8") _, out("zmm9") _, out("zmm10") _, out("zmm11") _, out("zmm12") _, out("zmm13") _,
+            out("zmm8") _, out("zmm9") _, out("zmm10") _, out("zmm11") _, out("zmm12") _, out("zmm13") _, out("zmm14") _,
             out("zmm16") _, out("zmm17") _, out("zmm18") _, out("zmm19") _, out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _,
             out("zmm24") _, out("zmm25") _, out("zmm26") _, out("zmm27") _, out("zmm28") _, out("zmm29") _, out("zmm30") _, out("zmm31") _,
             out("k1") _,
-            T = sym T, CTS = sym CTS, CAMP = sym CAMP5R,
-            KID1 = const O_KID1, UID1 = const O_UID1M,
+            CTS = sym CTS, CB = sym CAMPB, CJ = sym CJ, K = sym CLC,
+            CBO = const CAMPB_OFF,
             CAMPO = const C_CAMP, CIDO = const C_CID, UIDO = const C_UID, SCR = const C_SCR, PFD = const PFD,
         );
     }
