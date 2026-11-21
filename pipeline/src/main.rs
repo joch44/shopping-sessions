@@ -398,64 +398,74 @@ fn parse_chunk(
 }
 
 /// Events step 2 for one event_id partition: per id, the copy with the smallest
-/// (ingest_ts, file position) is kept; if it is valid it survives.
-/// Events step 2 for one event_id partition: per id, the copy with the smallest
-/// (ingest_ts, file position) is kept; if it is valid it survives. `pieces` are the
-/// per-thread vectors of this partition, indexed in place as (piece << 27 | index).
+/// (ingest_ts, file position) is kept; if it is valid it survives. `pieces` are this
+/// partition's slices from every thread, read in place.
+///
+/// The table holds (32-bit hash << 32 | copy index), so a probe compares hashes and only
+/// touches a record when they match (in practice only real duplicates). Winners are marked
+/// per copy and emitted in record order: both passes over the records are sequential.
 fn dedup(pieces: Vec<&[EventCopy]>, people: &People, scratch: &mut DedupScratch, out: &mut Scatter<Event>) {
-    const SHIFT: u32 = 27;
-    // Handles hold up to 31 pieces of < 2^27 copies; with more threads, merge the pieces.
-    let merged: Vec<EventCopy>;
-    let pieces = if pieces.len() < 32 {
-        pieces
-    } else {
-        merged = pieces.concat();
-        vec![&merged[..]]
-    };
     let total: usize = pieces.iter().map(|piece| piece.len()).sum();
-    assert!(pieces.iter().all(|p| p.len() < 1 << SHIFT), "dedup partition over 134M copies");
-    let get = |handle: u32| &pieces[(handle >> SHIFT) as usize][(handle & ((1 << SHIFT) - 1)) as usize];
-    // Open addressing over handles; u32::MAX is empty. Within one partition the low hash
-    // bits are all equal, so the table uses the high bits.
+    assert!(total < u32::MAX as usize, "dedup partition over 4G copies");
+    let starts: Vec<usize> = pieces.iter().scan(0, |at, piece| { let start = *at; *at += piece.len(); Some(start) }).collect();
+    let copy_at = |index: u32| {
+        let index = index as usize;
+        let piece = starts.partition_point(|&start| start <= index) - 1;
+        &pieces[piece][index - starts[piece]]
+    };
+    const EMPTY: u64 = u64::MAX;
     let slots = (total * 2).next_power_of_two().max(16);
-    let table = &mut scratch.table;
-    table.clear();
-    table.resize(slots, u32::MAX);
     let mask = slots - 1;
-    for (piece_index, piece) in pieces.iter().enumerate() {
-        for (index, copy) in piece.iter().enumerate() {
-            let handle = ((piece_index as u32) << SHIFT) | index as u32;
-            let mut slot = (mix(copy.id) >> 32) as usize & mask;
-            loop {
-                let held = table[slot];
-                if held == u32::MAX {
-                    table[slot] = handle;
-                    break;
-                }
-                let other = get(held);
+    let DedupScratch { table, winner, survivors } = scratch;
+    table.clear();
+    table.resize(slots, EMPTY);
+    winner.clear();
+    winner.resize(total, false);
+    let mut index: u32 = 0;
+    for copy in pieces.iter().copied().flatten() {
+        let h = mix(copy.id);
+        let tag = h >> 32;
+        // Within one partition the low hash bits are equal: index the table by middle bits.
+        let mut slot = (h >> 10) as usize & mask;
+        loop {
+            let held = table[slot];
+            if held == EMPTY {
+                table[slot] = (tag << 32) | u64::from(index);
+                winner[index as usize] = true;
+                break;
+            }
+            if held >> 32 == tag {
+                let other_index = held as u32;
+                let other = copy_at(other_index);
                 if other.id == copy.id {
                     if (copy.ingest, copy.seq) < (other.ingest, other.seq) {
-                        table[slot] = handle;
+                        table[slot] = (tag << 32) | u64::from(index);
+                        winner[other_index as usize] = false;
+                        winner[index as usize] = true;
                     }
                     break;
                 }
-                slot = (slot + 1) & mask;
             }
+            slot = (slot + 1) & mask;
+        }
+        index += 1;
+    }
+    // Survivors in record order, with each person lookup prefetched 16 survivors ahead.
+    survivors.clear();
+    for (copy, &won) in pieces.iter().copied().flatten().zip(winner.iter()) {
+        if won && copy.price != INVALID {
+            survivors.push(*copy);
         }
     }
-    let survivors = &mut scratch.survivors;
-    survivors.clear();
-    survivors.extend(table.iter().copied().filter(|&h| h != u32::MAX && get(h).price != INVALID));
-    // Person lookups miss the cache: issue each one 16 survivors ahead.
     const AHEAD: usize = 16;
-    for &handle in survivors.iter().take(AHEAD) {
-        people.prefetch(get(handle).user);
+    for copy in survivors.iter().take(AHEAD) {
+        people.prefetch(copy.user);
     }
     for at in 0..survivors.len() {
-        if let Some(&ahead) = survivors.get(at + AHEAD) {
-            people.prefetch(get(ahead).user);
+        if let Some(ahead) = survivors.get(at + AHEAD) {
+            people.prefetch(ahead.user);
         }
-        let copy = get(survivors[at]);
+        let copy = &survivors[at];
         let person = people.get(copy.user);
         out.push(person_partition(person), Event { person, ts: copy.ts, price: copy.price, category: copy.category });
     }
@@ -463,8 +473,9 @@ fn dedup(pieces: Vec<&[EventCopy]>, people: &People, scratch: &mut DedupScratch,
 
 #[derive(Default)]
 struct DedupScratch {
-    table: Vec<u32>,
-    survivors: Vec<u32>,
+    table: Vec<u64>,
+    winner: Vec<bool>,
+    survivors: Vec<EventCopy>,
 }
 
 // ---------------------------------------------------------------- sessions, attribution, aggregation
