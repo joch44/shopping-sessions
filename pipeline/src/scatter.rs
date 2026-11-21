@@ -21,6 +21,13 @@ pub struct Scatter<T> {
     cap: usize,
     lens: Vec<usize>,
     overflow: Vec<Vec<T>>,
+    /// 32-byte items: the even-indexed item of a partition waits here until its odd partner
+    /// arrives, then both are stored as one non-temporal 64-byte line. `flush` writes any
+    /// item still waiting; it must run before the arena is read.
+    pending: Vec<MaybeUninit<T>>,
+    has_pending: Vec<bool>,
+    /// Pairing is opt-in (`new_paired`): only callers that `flush` may use it.
+    paired: bool,
 }
 
 impl<T: Copy> Scatter<T> {
@@ -28,7 +35,28 @@ impl<T: Copy> Scatter<T> {
         let mut data = Vec::with_capacity(parts * cap);
         // SAFETY: MaybeUninit needs no initialization; only written slots are ever read.
         unsafe { data.set_len(parts * cap) };
-        Self { data, cap, lens: vec![0; parts], overflow: (0..parts).map(|_| Vec::new()).collect() }
+        let mut pending = Vec::with_capacity(parts);
+        // SAFETY: MaybeUninit needs no initialization; a slot is read only after it was written.
+        unsafe { pending.set_len(parts) };
+        Self { data, cap, lens: vec![0; parts], overflow: (0..parts).map(|_| Vec::new()).collect(), pending, has_pending: vec![false; parts], paired: false }
+    }
+
+    /// Like `new`, but 32-byte items are stored in non-temporal pairs; the caller must call
+    /// `flush` before the arena is read.
+    pub fn new_paired(parts: usize, cap: usize) -> Self {
+        Self { paired: true, ..Self::new(parts, cap) }
+    }
+
+    /// Writes 32-byte items still waiting for a partner (see `pending`). Call before `fence`.
+    pub fn flush(&mut self) {
+        for part in 0..self.lens.len() {
+            if self.has_pending[part] {
+                self.has_pending[part] = false;
+                let at = part * self.cap + self.lens[part] - 1;
+                // SAFETY: has_pending means pending[part] was written by `push`.
+                self.data[at].write(unsafe { self.pending[part].assume_init() });
+            }
+        }
     }
 
     #[inline(always)]
@@ -39,6 +67,33 @@ impl<T: Copy> Scatter<T> {
             // non-temporal store, which skips reading the line first (read-for-ownership).
             // Measured on the mirror: parse events 0.77 -> 0.655 s at 20M. Callers must `fence`
             // before other threads read the arena.
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+            if self.paired && std::mem::size_of::<T>() == 32 {
+                if len % 2 == 0 {
+                    let slot = self.data.as_mut_ptr().wrapping_add(part * self.cap + len);
+                    if len + 1 < self.cap && slot as usize % 64 == 0 {
+                        self.pending[part].write(item);
+                        self.has_pending[part] = true;
+                        self.lens[part] = len + 1;
+                        return;
+                    }
+                } else if self.has_pending[part] {
+                    let slot = self.data.as_mut_ptr().wrapping_add(part * self.cap + len - 1);
+                    // SAFETY: the pair (len - 1, len) is in bounds (len < cap) and 64-byte aligned
+                    // (checked when the first item was held); T is a 32-byte Copy type, so the
+                    // two items' bytes form one __m512i.
+                    unsafe {
+                        use std::arch::x86_64::{__m256i, __m512i, _mm512_inserti64x4, _mm512_castsi256_si512, _mm512_stream_si512};
+                        let a = std::mem::transmute_copy::<T, __m256i>(self.pending[part].assume_init_ref());
+                        let b = std::mem::transmute_copy::<T, __m256i>(&item);
+                        let line: __m512i = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(a), b);
+                        _mm512_stream_si512(slot.cast(), line);
+                    }
+                    self.has_pending[part] = false;
+                    self.lens[part] = len + 1;
+                    return;
+                }
+            }
             #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
             if std::mem::size_of::<T>() == 64 {
                 let slot = self.data.as_mut_ptr().wrapping_add(part * self.cap + len);
@@ -110,6 +165,31 @@ mod tests {
             for part in 0..3 {
                 let got: Vec<Line> = scatter.pieces(part).concat();
                 let want: Vec<Line> = (0..200).filter(|i| i % 3 == part as u64).map(item).collect();
+                assert_eq!(got, want, "cap {cap} part {part}");
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    #[repr(C, align(32))]
+    struct Half([u64; 4]);
+
+    #[test]
+    fn thirty_two_byte_items_round_trip() {
+        for cap in [0, 1, 2, 3, 7, 64] {
+            let mut scatter = Scatter::new_paired(3, cap);
+            let item = |i: u64| Half([i, i + 1, i + 2, i + 3]);
+            for i in 0..200u64 {
+                scatter.push((i % 3) as usize, item(i));
+                if i % 37 == 0 {
+                    scatter.flush(); // a chunk boundary in the middle of a pair
+                }
+            }
+            scatter.flush();
+            fence();
+            for part in 0..3 {
+                let got: Vec<Half> = scatter.pieces(part).concat();
+                let want: Vec<Half> = (0..200).filter(|i| i % 3 == part as u64).map(item).collect();
                 assert_eq!(got, want, "cap {cap} part {part}");
             }
         }

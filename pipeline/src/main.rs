@@ -12,6 +12,7 @@
 //! Env: DATA_DIR, OUTPUT_DIR (or the two arguments), NCPU (threads), TIMING=1 (stage
 //! times on stderr). Nothing is printed to stdout.
 
+mod compact;
 mod csv;
 mod hugealloc;
 mod key;
@@ -31,6 +32,7 @@ use memmap2::Mmap;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::csv::{ascii_digits, data_lines, for_each_record, parse_line};
+use crate::compact::EventCopy32;
 use crate::key::{Key, LongIds, key_of, mix};
 use crate::people::People;
 use crate::scatter::Scatter;
@@ -495,13 +497,15 @@ struct Context {
     unknown_category: u32,
     campaigns: FxHashMap<Key, u32>,
     longs: LongIds,
+    /// Packed event_ids travel as 32-byte EventCopy32 (category must fit 8 bits).
+    compact: bool,
 }
 
 
 
-/// Events steps 3 (validate) and 4 (late) for one copy: Some((user key, ts, price, category)).
+/// Events steps 3 (validate) and 4 (late) for one copy: Some((user_id bytes, ts, price, category)).
 #[inline]
-fn judge(context: &Context, fields: &[Option<&[u8]>; 7], ingest: i64, dates: &mut ts::DateCache) -> Option<(Key, i64, u32, u32)> {
+fn judge<'a>(context: &Context, fields: &[Option<&'a [u8]>; 7], ingest: i64, dates: &mut ts::DateCache) -> Option<(&'a [u8], i64, u32, u32)> {
     let [_, user, ts, _, kind, product, price] = *fields;
     let (user, product, kind) = (user?, product?, kind?);
     let purchase = match kind {
@@ -536,7 +540,7 @@ fn judge(context: &Context, fields: &[Option<&[u8]>; 7], ingest: i64, dates: &mu
     } else {
         0
     };
-    Some((key_of(user, Some(&context.longs)), ts, price, category))
+    Some((user, ts, price, category))
 }
 
 #[inline]
@@ -550,8 +554,11 @@ fn person_partition(person: Key) -> usize {
 }
 
 struct ParseState {
-    events: Scatter<EventCopy>, // by event_id partition
-    clicks: Scatter<Click>,     // by person partition
+    events: Scatter<EventCopy>,     // by event_id partition (all copies, or only unpackable event_ids when compact)
+    events32: Scatter<EventCopy32>, // compact: packed event_ids, by partition of the packed id
+    slow_users: Vec<Key>,           // compact: user keys that do not pack, referenced by EventCopy32.user
+    thread: u64,                    // index of this state's thread (for slow_users references)
+    clicks: Scatter<Click>,         // by person partition
     dates: ts::DateCache,
 }
 
@@ -568,17 +575,35 @@ fn parse_chunk(
         Kind::Event => {
             let file_seq = (chunk.file as u64) << 40;
             // Step 1: for_each_record drops malformed lines.
+            let window_start = context.window.0;
             for_each_record::<7>(bytes_of(&event_maps[chunk.file]), chunk.start, chunk.end, |fields, offset| {
                 let Some(event_id) = fields[0] else { return }; // step 1: empty event_id
-                let id = key_of(event_id, None);
                 let ingest = fields[3].and_then(|v| ts::parse_ingest(v, &mut state.dates)).unwrap_or(NEVER);
+                if context.compact {
+                    if let Some(id) = compact::pack62(event_id) {
+                        let copy = match judge(context, fields, ingest, &mut state.dates) {
+                            Some((user, ts, price, category)) => {
+                                let user = compact::pack62(user).unwrap_or_else(|| {
+                                    state.slow_users.push(key_of(user, Some(&context.longs)));
+                                    compact::SLOW_USER | state.thread << 40 | (state.slow_users.len() as u64 - 1)
+                                });
+                                EventCopy32 { id, user, ingest, ts: (ts - window_start) as u32, price_cat: price << 8 | category }
+                            }
+                            None => EventCopy32 { id, user: 0, ingest, ts: 0, price_cat: compact::INVALID32 },
+                        };
+                        state.events32.push((compact::mix64(id) as usize) & (dedup_partitions() - 1), copy);
+                        return;
+                    }
+                }
+                let id = key_of(event_id, None);
                 let seq = file_seq | offset as u64;
                 let copy = match judge(context, fields, ingest, &mut state.dates) {
-                    Some((user, ts, price, category)) => EventCopy { id, user, seq, ingest, ts, price, category },
+                    Some((user, ts, price, category)) => EventCopy { id, user: key_of(user, Some(&context.longs)), seq, ingest, ts, price, category },
                     None => EventCopy { id, user: 0, seq, ingest, ts: 0, price: INVALID, category: 0 },
                 };
                 state.events.push(dedup_partition(id), copy);
             });
+            state.events32.flush();
             crate::scatter::fence(); // the arena is read by other threads in dedup
         }
         Kind::Click => {
@@ -638,7 +663,7 @@ fn dedup(pieces: Vec<&[EventCopy]>, people: &People, scratch: &mut DedupScratch,
     const EMPTY: u64 = u64::MAX;
     let slots = (total * 2).next_power_of_two().max(16);
     let mask = slots - 1;
-    let DedupScratch { table, winner, survivors } = scratch;
+    let DedupScratch { table, winner, survivors, .. } = scratch;
     table.clear();
     table.resize(slots, EMPTY);
     winner.clear();
@@ -698,6 +723,92 @@ struct DedupScratch {
     table: Vec<u64>,
     winner: Vec<bool>,
     survivors: Vec<EventCopy>,
+    survivors32: Vec<(Key, u32, u32)>, // (user key, ts after window_start, price_cat)
+}
+
+/// Set when two packed copies of one event_id tie on ingest_ts but differ (see dedup32).
+static TIE_CONFLICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `dedup` for packed copies (EventCopy32). Same table and passes; an equal-ingest tie keeps
+/// the copy already held (rules.md: copies with equal ingest_ts are identical).
+fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>], window_start: i64, scratch: &mut DedupScratch, out: &mut Scatter<Event>) {
+    let total: usize = pieces.iter().map(|piece| piece.len()).sum();
+    assert!(total < u32::MAX as usize, "dedup partition over 4G copies");
+    let starts: Vec<usize> = pieces.iter().scan(0, |at, piece| { let start = *at; *at += piece.len(); Some(start) }).collect();
+    let copy_at = |index: u32| {
+        let index = index as usize;
+        let piece = starts.partition_point(|&start| start <= index) - 1;
+        &pieces[piece][index - starts[piece]]
+    };
+    const EMPTY: u64 = u64::MAX;
+    let slots = (total * 2).next_power_of_two().max(16);
+    let mask = slots - 1;
+    let DedupScratch { table, winner, survivors32, .. } = scratch;
+    table.clear();
+    table.resize(slots, EMPTY);
+    winner.clear();
+    winner.resize(total, false);
+    let mut index: u32 = 0;
+    for copy in pieces.iter().copied().flatten() {
+        let h = compact::mix64(copy.id);
+        let tag = h >> 32;
+        // Within one partition the low 12 hash bits (up to 4096 partitions) are equal: index
+        // the table above them.
+        let mut slot = (h >> 20) as usize & mask;
+        loop {
+            let held = table[slot];
+            if held == EMPTY {
+                table[slot] = (tag << 32) | u64::from(index);
+                winner[index as usize] = true;
+                break;
+            }
+            if held >> 32 == tag {
+                let other_index = held as u32;
+                let other = copy_at(other_index);
+                if other.id == copy.id {
+                    if copy.ingest < other.ingest {
+                        table[slot] = (tag << 32) | u64::from(index);
+                        winner[other_index as usize] = false;
+                        winner[index as usize] = true;
+                    } else if copy.ingest == other.ingest && (copy.user, copy.ts, copy.price_cat) != (other.user, other.ts, other.price_cat) {
+                        // Equal ingest_ts but different copies: impossible under rules.md (Events
+                        // step 2). The reference then keeps the first copy in file order, which
+                        // this record cannot see: rerun the whole job on the exact 64-byte path.
+                        TIE_CONFLICT.store(true, Ordering::Relaxed);
+                    }
+                    break;
+                }
+            }
+            slot = (slot + 1) & mask;
+        }
+        index += 1;
+    }
+    survivors32.clear();
+    for (copy, &won) in pieces.iter().copied().flatten().zip(winner.iter()) {
+        if won && copy.price_cat != compact::INVALID32 {
+            let user = if copy.user & compact::SLOW_USER != 0 {
+                slow_users[((copy.user >> 40) & 0x7F_FFFF) as usize][(copy.user & 0xFF_FFFF_FFFF) as usize]
+            } else {
+                compact::unpack62_key(copy.user)
+            };
+            survivors32.push((user, copy.ts, copy.price_cat));
+        }
+    }
+    const AHEAD: usize = 16;
+    for &(user, _, _) in survivors32.iter().take(AHEAD) {
+        people.prefetch(user);
+    }
+    for at in 0..survivors32.len() {
+        if let Some(&(ahead, _, _)) = survivors32.get(at + AHEAD) {
+            people.prefetch(ahead);
+        }
+        let (user, ts, price_cat) = survivors32[at];
+        let person = people.get(user);
+        out.push(
+            person_partition(person),
+            Event { person, ts: window_start + i64::from(ts), price: price_cat >> 8, category: price_cat & 0xFF },
+        );
+    }
 }
 
 // ---------------------------------------------------------------- sessions, attribution, aggregation
@@ -1168,7 +1279,12 @@ fn run() -> Result<()> {
     category_names.push(b"unknown".to_vec());
     timer.mark("lookups + mmap");
 
-    let context = Context { window, products, unknown_category, campaigns, longs: LongIds::default() };
+    // Compact copies hold the category in 8 bits and ts as u32 ms after window_start: a wider
+    // category set or a window of 2^32 ms (~49.7 days) or more takes the 64-byte path.
+    let compact = category_names.len() <= 256
+        && window.1.saturating_sub(window.0) < (1i64 << 32)
+        && std::env::var_os("PIPE_LEGACY").is_none();
+    let context = Context { window, products, unknown_category, campaigns, longs: LongIds::default(), compact };
 
     // A+B. Task 0 resolves links while the other threads parse events (largest chunks
     // first). resolve_people fans its phases out over `threads` workers of its own, so links
@@ -1187,13 +1303,20 @@ fn run() -> Result<()> {
     let event_cap = per_buffer(total_bytes(&event_maps), 77, dedup_parts);
     let click_cap = per_buffer(total_bytes(&click_maps), 47, person_parts);
     let survivor_cap = per_buffer(total_bytes(&event_maps), 77, person_parts);
+    let next_thread = AtomicUsize::new(0);
     let new_events = || ParseState {
-        events: Scatter::new(dedup_parts, event_cap),
+        events: Scatter::new(dedup_parts, if compact { 0 } else { event_cap }),
+        events32: Scatter::new_paired(dedup_parts, if compact { event_cap + (event_cap & 1) } else { 0 }),
+        slow_users: Vec::new(),
+        thread: next_thread.fetch_add(1, Ordering::Relaxed) as u64,
         clicks: Scatter::new(person_parts, 0),
         dates: ts::DateCache::default(),
     };
     let new_clicks = || ParseState {
         events: Scatter::new(dedup_parts, 0),
+        events32: Scatter::new_paired(dedup_parts, 0),
+        slow_users: Vec::new(),
+        thread: u64::MAX,
         clicks: Scatter::new(person_parts, click_cap),
         dates: ts::DateCache::default(),
     };
@@ -1212,7 +1335,14 @@ fn run() -> Result<()> {
     let clicked = run_tasks(threads, click_chunks.len(), new_clicks, |state, at| {
         parse_chunk(&context, Some(&people), &event_maps, &click_maps, click_chunks[at], state)
     });
-    let event_parts: Vec<Scatter<EventCopy>> = parsed.into_iter().map(|s| s.events).collect();
+    let mut slow_users: Vec<Vec<Key>> = (0..threads).map(|_| Vec::new()).collect();
+    let mut event_parts: Vec<Scatter<EventCopy>> = Vec::new();
+    let mut event32_parts: Vec<Scatter<EventCopy32>> = Vec::new();
+    for state in parsed {
+        slow_users[state.thread as usize] = state.slow_users;
+        event_parts.push(state.events);
+        event32_parts.push(state.events32);
+    }
     let click_parts: Vec<Scatter<Click>> = clicked.into_iter().map(|s| s.clicks).collect();
     timer.mark("parse clicks");
 
@@ -1222,12 +1352,25 @@ fn run() -> Result<()> {
         dedup_parts,
         || (DedupScratch::default(), Scatter::new(person_parts, survivor_cap)),
         |(scratch, out), p| {
+            let pieces32: Vec<&[EventCopy32]> = event32_parts.iter().flat_map(|scatter| scatter.pieces(p)).filter(|s| !s.is_empty()).collect();
+            if !pieces32.is_empty() {
+                dedup32(pieces32, &people, &slow_users, context.window.0, scratch, out);
+            }
             let pieces: Vec<&[EventCopy]> = event_parts.iter().flat_map(|scatter| scatter.pieces(p)).filter(|s| !s.is_empty()).collect();
-            dedup(pieces, &people, scratch, out)
+            if !pieces.is_empty() {
+                dedup(pieces, &people, scratch, out)
+            }
         },
     );
     let person_events: Vec<Scatter<Event>> = deduped.into_iter().map(|(_, out)| out).collect();
     timer.mark("dedup");
+    if TIE_CONFLICT.load(Ordering::Relaxed) {
+        // Nothing has been written yet: start over on the exact path (same args, same env).
+        use std::os::unix::process::CommandExt;
+        eprintln!("pipeline: equal-ingest copies differ; rerunning on the 64-byte path");
+        let error = std::process::Command::new(std::env::current_exe()?).args(std::env::args_os().skip(1)).env("PIPE_LEGACY", "1").exec();
+        return Err(error.into());
+    }
 
     // D. per person partition, heaviest first.
     let mut order: Vec<usize> = (0..person_parts).collect();
