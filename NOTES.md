@@ -41,7 +41,9 @@ Competition VM: 1 NUMA node, 48 MiB L3, THP `madvise`, 128 GB virtual disk (`sda
 ## Calibration (sim -> board): see `tools/calibration.csv`, `tools/to_board.py`
 
 Reference: 123.7 s on nolimit-sim (mean of 4 runs, 20M, seeds 11-13) vs ~124 s on the board:
-factor 1.00. Recalibrate with every submission.
+factor 1.00 for the CPU-bound reference. Rust v9 (870a9c2): mirror 2.244 s (median of 9) vs board
+1.97 s, factor 0.878: the grader is ~12% faster than the mirror for our fast builds. `to_board.py`
+uses only pairs within 5x of the queried time. Recalibrate with every submission.
 
 ## Contest (known)
 
