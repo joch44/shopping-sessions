@@ -499,6 +499,23 @@ struct DedupScratch {
 
 // ---------------------------------------------------------------- sessions, attribution, aggregation
 
+/// One event within a person's group: the person is the group's, so only what the session
+/// sweep reads (16 bytes, half an Event) is moved by the per-person sort.
+#[derive(Clone, Copy)]
+pub struct SessionEvent {
+    pub ts: i64,
+    pub price: u32,
+    pub category: u32,
+}
+
+/// One click within a person's group (32 bytes instead of 48).
+#[derive(Clone, Copy)]
+pub struct SessionClick {
+    pub click_id: Key,
+    pub ts: i64,
+    pub campaign: u32,
+}
+
 pub struct UserRow {
     pub person: Key,
     pub day: i32,
@@ -599,7 +616,7 @@ fn flush(person: Key, acc: &mut Option<DayAccumulator>, rows: &mut Vec<UserRow>,
 }
 
 /// One person: their events sorted by ts, their clicks sorted by (ts, click_id).
-fn person_sessions(person: Key, events: &[Event], clicks: &[Click], state: &mut PeopleState, category_names: &[Vec<u8>]) {
+fn person_sessions(person: Key, events: &[SessionEvent], clicks: &[SessionClick], state: &mut PeopleState, category_names: &[Vec<u8>]) {
     let mut day_acc: Option<DayAccumulator> = None;
     let mut first = 0;
     while first < events.len() {
@@ -722,7 +739,7 @@ fn people_partition(
     let spare = grouped.spare_capacity_mut();
     for (event, &group) in event_pieces.iter().copied().flatten().zip(event_group.iter()) {
         let at = &mut cursor[group as usize];
-        spare[*at as usize].write(*event);
+        spare[*at as usize].write(SessionEvent { ts: event.ts, price: event.price, category: event.category });
         *at += 1;
     }
     // SAFETY: the counting sort wrote every slot in 0..total exactly once.
@@ -749,7 +766,7 @@ fn people_partition(
     for (click, &group) in click_pieces.iter().copied().flatten().zip(click_group.iter()) {
         if group != u32::MAX {
             let at = &mut cursor[group as usize];
-            spare[*at as usize].write(*click);
+            spare[*at as usize].write(SessionClick { click_id: click.click_id, ts: click.ts, campaign: click.campaign });
             *at += 1;
         }
     }
@@ -773,10 +790,10 @@ struct GroupScratch {
     event_group: Vec<u32>,
     event_start: Vec<u32>,
     cursor: Vec<u32>,
-    grouped: Vec<Event>,
+    grouped: Vec<SessionEvent>,
     click_group: Vec<u32>,
     click_start: Vec<u32>,
-    grouped_clicks: Vec<Click>,
+    grouped_clicks: Vec<SessionClick>,
 }
 
 // ---------------------------------------------------------------- main
