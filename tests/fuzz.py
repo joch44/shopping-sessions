@@ -185,10 +185,19 @@ class Fuzzer:
         r = self.r
         out = []
         users = list(user_times)
+        # rules.md Clicks step 2 guarantees copies of a click have identical values, so a
+        # click_id is mutated once and every copy (including generator duplicates) reuses it;
+        # only quoting and malformation vary per copy.
+        mutated = {}
         for line in lines:
             fields = [unquote_simple(f) for f in line.split(",")]
             if len(fields) != 4:
                 out.append(line)
+                continue
+            if fields[0] in mutated:
+                same = mutated[fields[0]]
+                text = ",".join(self.quote(same))
+                out.append(self.break_line(same) if self.chance(0.2) else text)
                 continue
             click_id, user, campaign, ts = fields
             if users and self.chance(3):                        # aim at an event time exactly
@@ -202,9 +211,12 @@ class Fuzzer:
             if self.chance(0.5):
                 user = self.id_variant(user)
             fields = [click_id, user, campaign, ts]
+            mutated[click_id] = fields
             copies = 1 + (r.randint(1, 2) if self.chance() else 0)
-            if self.chance(0.5):                                # same-ms twin with another id
-                out.append(",".join(self.quote([click_id + "a", user, campaign, ts])))
+            if self.chance(0.5) and click_id + "a" not in mutated:   # same-ms twin with another id
+                twin = [click_id + "a", user, campaign, ts]
+                mutated[twin[0]] = twin
+                out.append(",".join(self.quote(twin)))
             for _ in range(copies):
                 text = ",".join(self.quote(fields))
                 if self.chance(0.2):

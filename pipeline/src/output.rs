@@ -11,6 +11,7 @@ use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 use rustc_hash::FxHashMap;
 
+use crate::key::Key;
 use crate::{CampaignCounts, ORGANIC, Result, UserRow};
 
 const USER_SCHEMA: &str = "message user_daily {
@@ -87,11 +88,16 @@ fn bytes(value: &[u8]) -> ByteArray {
     ByteArray::from(value.to_vec())
 }
 
-pub fn write_user_daily(path: &Path, rows: &[UserRow], names: &[Box<[u8]>], categories: &[Vec<u8>]) -> Result<()> {
+pub fn write_user_daily(
+    path: &Path,
+    rows: &[UserRow],
+    name: &impl Fn(Key) -> Vec<u8>,
+    categories: &[Vec<u8>],
+) -> Result<()> {
     let top: Vec<ByteArray> = rows.iter().filter_map(|r| r.top_category.map(|c| bytes(&categories[c as usize]))).collect();
     let top_levels: Vec<i16> = rows.iter().map(|r| i16::from(r.top_category.is_some())).collect();
     write(path, USER_SCHEMA, vec![
-        Column::Bytes(rows.iter().map(|r| bytes(&names[r.person as usize])).collect(), None),
+        Column::Bytes(rows.iter().map(|r| ByteArray::from(name(r.person))).collect(), None),
         Column::Int32(rows.iter().map(|r| r.day).collect()),
         Column::Int64(rows.iter().map(|r| r.sessions as i64).collect()),
         Column::Int64(rows.iter().map(|r| r.events as i64).collect()),
