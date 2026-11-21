@@ -500,6 +500,7 @@ pub struct CampaignCounts {
 }
 
 struct PeopleState {
+    group_table: Vec<u32>,
     user_rows: Vec<UserRow>,
     campaign_daily: FxHashMap<(u32, i32), CampaignCounts>,
     assist_stamp: Vec<u64>,
@@ -586,29 +587,92 @@ fn person_sessions(person: Key, events: &[Event], clicks: &[Click], state: &mut 
     flush(person, &mut day_acc, &mut state.user_rows, category_names);
 }
 
-fn people_partition(mut events: Vec<Event>, mut clicks: Vec<Click>, longs: &LongIds, state: &mut PeopleState, category_names: &[Vec<u8>]) {
-    // Person keys only need grouping here, so plain integer order; ts order within a person.
-    events.sort_unstable_by_key(|event| (event.person, event.ts));
-    clicks.sort_unstable_by(|a, b| {
-        (a.person, a.ts).cmp(&(b.person, b.ts)).then_with(|| key::cmp(a.click_id, b.click_id, longs))
-    });
-    let mut click_at = 0;
-    let mut at = 0;
-    while at < events.len() {
-        let person = events[at].person;
-        let mut end = at + 1;
-        while end < events.len() && events[end].person == person {
-            end += 1;
+/// Groups one person partition by person (hash + counting sort, no full sort), then runs
+/// each person's events (sorted by ts) and clicks (sorted by ts, click_id) through
+/// `person_sessions`. Clicks of a person with no surviving events can credit nothing.
+fn people_partition(events: Vec<Event>, clicks: Vec<Click>, longs: &LongIds, state: &mut PeopleState, category_names: &[Vec<u8>]) {
+    if events.is_empty() {
+        return;
+    }
+    // person -> group number, open addressing over group numbers (u32::MAX = empty).
+    let slots = (events.len() * 2).next_power_of_two().max(16);
+    let mask = slots - 1;
+    let table = &mut state.group_table;
+    table.clear();
+    table.resize(slots, u32::MAX);
+    let mut group_keys: Vec<Key> = Vec::new();
+    let find = |table: &[u32], group_keys: &[Key], person: Key| -> (usize, Option<u32>) {
+        let mut slot = (mix(person) >> 24) as usize & mask;
+        loop {
+            match table[slot] {
+                u32::MAX => return (slot, None),
+                group if group_keys[group as usize] == person => return (slot, Some(group)),
+                _ => slot = (slot + 1) & mask,
+            }
         }
-        while click_at < clicks.len() && clicks[click_at].person < person {
-            click_at += 1;
+    };
+    let mut event_group: Vec<u32> = Vec::with_capacity(events.len());
+    for event in &events {
+        let group = match find(table, &group_keys, event.person) {
+            (_, Some(group)) => group,
+            (slot, None) => {
+                table[slot] = group_keys.len() as u32;
+                group_keys.push(event.person);
+                (group_keys.len() - 1) as u32
+            }
+        };
+        event_group.push(group);
+    }
+    let groups = group_keys.len();
+    // Counting sort of events, then of clicks, into group order.
+    let mut event_start = vec![0u32; groups + 1];
+    for &group in &event_group {
+        event_start[group as usize + 1] += 1;
+    }
+    for g in 0..groups {
+        event_start[g + 1] += event_start[g];
+    }
+    let mut cursor = event_start.clone();
+    let mut grouped: Vec<Event> = Vec::with_capacity(events.len());
+    let spare = grouped.spare_capacity_mut();
+    for (event, &group) in events.iter().zip(&event_group) {
+        let at = &mut cursor[group as usize];
+        spare[*at as usize].write(*event);
+        *at += 1;
+    }
+    // SAFETY: the counting sort wrote every slot in 0..events.len() exactly once.
+    unsafe { grouped.set_len(events.len()) };
+    let mut click_group: Vec<u32> = Vec::with_capacity(clicks.len());
+    let mut click_start = vec![0u32; groups + 1];
+    for click in &clicks {
+        let group = find(table, &group_keys, click.person).1.unwrap_or(u32::MAX);
+        click_group.push(group);
+        if group != u32::MAX {
+            click_start[group as usize + 1] += 1;
         }
-        let click_start = click_at;
-        while click_at < clicks.len() && clicks[click_at].person == person {
-            click_at += 1;
+    }
+    for g in 0..groups {
+        click_start[g + 1] += click_start[g];
+    }
+    let kept_clicks = click_start[groups] as usize;
+    let mut cursor = click_start.clone();
+    let mut grouped_clicks: Vec<Click> = Vec::with_capacity(kept_clicks);
+    let spare = grouped_clicks.spare_capacity_mut();
+    for (click, &group) in clicks.iter().zip(&click_group) {
+        if group != u32::MAX {
+            let at = &mut cursor[group as usize];
+            spare[*at as usize].write(*click);
+            *at += 1;
         }
-        person_sessions(person, &events[at..end], &clicks[click_start..click_at], state, category_names);
-        at = end;
+    }
+    // SAFETY: the counting sort wrote every slot in 0..kept_clicks exactly once.
+    unsafe { grouped_clicks.set_len(kept_clicks) };
+    for g in 0..groups {
+        let person_events = &mut grouped[event_start[g] as usize..event_start[g + 1] as usize];
+        person_events.sort_unstable_by_key(|event| event.ts);
+        let person_clicks = &mut grouped_clicks[click_start[g] as usize..click_start[g + 1] as usize];
+        person_clicks.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| key::cmp(a.click_id, b.click_id, longs)));
+        person_sessions(group_keys[g], person_events, person_clicks, state, category_names);
     }
 }
 
@@ -735,6 +799,7 @@ fn run() -> Result<()> {
         threads,
         PERSON_PARTITIONS,
         || PeopleState {
+            group_table: Vec::new(),
             user_rows: Vec::new(),
             campaign_daily: FxHashMap::default(),
             assist_stamp: vec![u64::MAX; campaign_count],
