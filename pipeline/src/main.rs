@@ -14,6 +14,7 @@
 
 mod blocks;
 mod compact;
+mod cpuguard;
 mod csv;
 mod hugealloc;
 mod key;

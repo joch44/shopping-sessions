@@ -14,8 +14,19 @@ RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \
  && cp target/x86_64-unknown-linux-gnu/release/pipeline /pipeline \
  && chmod 0755 /pipeline
 
+# Stage 2: the same pipeline for hosts without AVX-512 (pipeline/src/cpuguard.rs execs one of
+# these before any AVX-512 code runs): x86-64-v3 (AVX2) and x86-64-v2.
+FROM build AS portable
+RUN RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static" cargo build --release --locked --target x86_64-unknown-linux-gnu --target-dir /t3 \
+ && cp /t3/x86_64-unknown-linux-gnu/release/pipeline /pipeline-v3 \
+ && RUSTFLAGS="-C target-cpu=x86-64-v2 -C target-feature=+crt-static" cargo build --release --locked --target x86_64-unknown-linux-gnu --target-dir /t2 \
+ && cp /t2/x86_64-unknown-linux-gnu/release/pipeline /pipeline-v2 \
+ && chmod 0755 /pipeline-v3 /pipeline-v2
+
 FROM scratch
 COPY --from=build /pipeline /pipeline
+COPY --from=portable /pipeline-v3 /pipeline-v3
+COPY --from=portable /pipeline-v2 /pipeline-v2
 # The scorer runs as uid 1000 with a read-only root; the binary needs neither a
 # home nor /tmp, and reads DATA_DIR / OUTPUT_DIR from the environment.
 CMD ["/pipeline"]
