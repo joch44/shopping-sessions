@@ -19,7 +19,29 @@ instructions Cascade Lake lacks (VBMI, VBMI2, IFMA, VPOPCNTDQ, BITALG, GFNI, VAE
 `native` build can die with SIGILL on the grader.
 
 Analysis VM: THP `madvise`, kernel 7.0.0-1017-azure, 758 GB free disk.
-Competition VM: TODO lscpu NUMA/L3, disk speed (fio), THP, I/O floors.
+Competition VM: 1 NUMA node, 48 MiB L3, THP `madvise`, 128 GB virtual disk (`sda`).
+
+## Floors on the competition VM (2026-11-21, `tools/floor`, 8 threads, byte-split 8 MiB chunks)
+
+| | 20M events (1.87 GB) | 60M events (5.62 GB) |
+|---|---|---|
+| Docker start+exit, python-slim image running `true` | 0.29 s | |
+| Docker FROM-scratch image + warm read of all input | 0.24 s | |
+| Cold read (page cache dropped) | 1.99 s (0.94 GB/s) | 6.54 s (0.86 GB/s) |
+| Warm read (pread into buffers, no work) | 0.08 s (22 GB/s) | 0.21 s (26 GB/s) |
+| Warm newline count, 8 threads | 0.13 s (14.4 GB/s) | 0.36 s (15.6 GB/s) |
+| Warm newline count, 1 / 2 / 4 threads | 0.46 / 0.26 / 0.15 s | |
+
+- A simple pass saturates memory bandwidth at ~14-15 GB/s from 4 threads up.
+- The board leader's 1.3 s at ~20M cannot be a cold read (cold read alone is ~2 s here):
+  the median-of-3 rule for runs under 20 s means the scored run is effectively warm.
+- Container start/exit is ~0.15-0.3 s of any score: a FROM-scratch (or distroless) image with
+  a static binary saves ~0.05-0.1 s over python-slim.
+
+## Calibration (sim -> board): see `tools/calibration.csv`, `tools/to_board.py`
+
+Reference: 123.7 s on nolimit-sim (mean of 4 runs, 20M, seeds 11-13) vs ~124 s on the board:
+factor 1.00. Recalibrate with every submission.
 
 ## Contest (known)
 
@@ -49,11 +71,18 @@ Competition VM: TODO lscpu NUMA/L3, disk speed (fio), THP, I/O floors.
   sorts before lowercase and becomes the person's name.
 - Organizers confirm DuckDB/Polars CSV readers do not follow `rules.md`.
 
+## Scoring (track page)
+
+- Practice: hidden ~20M events; one timed run, or median of 3 if under 20 s; limit 2x baseline
+  (343.8 s) and at most 5 min. Board leader ~1.3 s; our reference 124 s.
+- Final: new ~60M dataset, 3 runs, median; each capped at 3 min. The 5+ fastest re-timed 5x on
+  an idle machine; that median decides. Up to ~20% machine-to-machine spread on practice.
+- Clock: container start to exit. Dev set check first (at most 3 min). 2 submissions/hour.
+- Keep the repo public with every submitted commit until results are published.
+
 ## Contest (unknown; ask)
 
-- Graded `--events` / `--clicks`. Best guess: ~60M events + 15M clicks (generator comment:
-  "a few hundred at the full 75M rows"; dev set ratio is 4:1).
-- Cold or warm page cache? One seed or several? One run or several?
+- Cold or warm page cache on the first run? (Practice median-of-3 makes it moot for fast entries.)
 - Starter kit: generator README mentions "the starter's `make dev`" and code mentions
   "fixture E5". Do we have it (fixtures with expected outputs)?
 
