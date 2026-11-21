@@ -5,7 +5,8 @@
 
 Each case is CASES_DIR/<name>/{input,expected} (the organizers' fixtures and
 tests/corpus/cases share this layout). CMD gets DATA_DIR, OUTPUT_DIR and
-SCRATCH_DIR in its environment. Prints one line per case and the failures'
+SCRATCH_DIR in its environment, and DATA_DIR OUTPUT_DIR as its last two arguments
+(like the organizers' run_fixtures.py, so scripts/docker_run.sh works). Prints one line per case and the failures'
 diffs; exits 1 if any case fails.
 """
 import os
@@ -21,7 +22,7 @@ def run_case(case_dir, command):
     with tempfile.TemporaryDirectory() as output, tempfile.TemporaryDirectory() as scratch:
         env = dict(os.environ, DATA_DIR=os.path.join(case_dir, "input"), OUTPUT_DIR=output,
                    SCRATCH_DIR=scratch)
-        process = subprocess.run(command, env=env, capture_output=True, text=True, timeout=600)
+        process = subprocess.run(command + [env["DATA_DIR"], output], env=env, capture_output=True, text=True, timeout=600)
         if process.returncode != 0:
             return False, [f"exit {process.returncode}", process.stderr[-1500:]]
         problems = []

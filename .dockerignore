@@ -1,0 +1,4 @@
+*
+!pipeline/Cargo.toml
+!pipeline/Cargo.lock
+!pipeline/src
