@@ -201,58 +201,200 @@ fn load_window(data: &Path) -> Result<(i64, i64)> {
 // ---------------------------------------------------------------- people (rules.md "Linked IDs")
 
 /// ID key -> key of its person's name (the byte-wise smallest ID). IDs absent are their own person.
-/// Runs on one thread while the others parse events (links are ~1% of the input).
-fn resolve_people(maps: &[Option<Mmap>], longs: &LongIds) -> People {
-    let mut pairs: Vec<(Key, Key)> = Vec::new();
-    for map in maps {
-        let data = bytes_of(map);
-        for_each_record::<2>(data, 0, data.len(), |fields, _| {
+/// rules.md "Linked IDs" on all threads. Link files are cut into byte chunks and parsed in
+/// parallel (same splitter and line rule as events). IDs are interned to dense indices per
+/// hash bucket. A lock-free union-find always links the larger root index under the
+/// smaller, so the components never depend on thread timing. Each component's name is its
+/// byte-wise smallest ID (key::cmp, long IDs included), picked by a CAS minimum, and the
+/// People table is built in parallel. The table's answers are identical for any NCPU.
+fn resolve_people(maps: &[Option<Mmap>], threads: usize, longs: &LongIds) -> People {
+    use std::sync::atomic::AtomicU32;
+    const BUCKET_BITS: u32 = 8;
+    const BUCKETS: usize = 1 << BUCKET_BITS;
+    const SPAN: usize = 1 << 16; // pairs / nodes per union and naming task
+
+    // 1. Parse: byte chunks of every link file (at most 1 MiB, so all threads get work).
+    let chunk = chunk_bytes().min(1 << 20);
+    let mut ranges = Vec::new();
+    for (file, map) in maps.iter().enumerate() {
+        let len = bytes_of(map).len();
+        let mut start = 0;
+        while start < len {
+            let end = (start + chunk).min(len);
+            ranges.push((file, start, end));
+            start = end;
+        }
+    }
+    let mut pieces: Vec<Vec<(Key, Key)>> = vec![Vec::new(); ranges.len()];
+    for (at, pairs) in run_tasks(threads, ranges.len(), Vec::new, |out: &mut Vec<(usize, Vec<(Key, Key)>)>, at| {
+        let (file, start, end) = ranges[at];
+        let mut pairs = Vec::new();
+        for_each_record::<2>(bytes_of(&maps[file]), start, end, |fields, _| {
+            // Step 1: malformed lines and lines with an empty side are dropped.
             if let (Some(a), Some(b)) = (fields[0], fields[1]) {
                 pairs.push((key_of(a, Some(longs)), key_of(b, Some(longs))));
             }
         });
+        out.push((at, pairs));
+    })
+    .into_iter()
+    .flatten()
+    {
+        pieces[at] = pairs;
     }
+    let mut first_pair = Vec::with_capacity(pieces.len() + 1);
+    let mut pair_count = 0usize;
+    for piece in &pieces {
+        first_pair.push(pair_count);
+        pair_count += piece.len();
+    }
+    if pair_count == 0 {
+        return People::new(std::iter::empty());
+    }
+    assert!(pair_count < (1 << 31), "over 2^31 links");
 
-    let mut index: FxHashMap<Key, u32> = FxHashMap::default();
-    let mut keys: Vec<Key> = Vec::new();
-    let mut parent: Vec<u32> = Vec::new();
-    let mut size: Vec<u32> = Vec::new();
-    fn find(parent: &mut [u32], mut node: u32) -> u32 {
-        while parent[node as usize] != node {
-            let grand = parent[parent[node as usize] as usize];
-            parent[node as usize] = grand;
+    // 2. Intern: every endpoint (pair * 2 + side) to its ID's hash bucket, then per bucket
+    // a small table gives each distinct ID a local index; bucket offsets make them global.
+    let bucket_of = |key: Key| (mix(key) >> (64 - BUCKET_BITS)) as usize;
+    let mut by_piece: Vec<Vec<Vec<(Key, u32)>>> = vec![Vec::new(); pieces.len()];
+    for (at, buckets) in run_tasks(threads, pieces.len(), Vec::new, |out: &mut Vec<(usize, Vec<Vec<(Key, u32)>>)>, at| {
+        let mut buckets: Vec<Vec<(Key, u32)>> = (0..BUCKETS).map(|_| Vec::new()).collect();
+        for (i, &(a, b)) in pieces[at].iter().enumerate() {
+            let end = ((first_pair[at] + i) * 2) as u32;
+            buckets[bucket_of(a)].push((a, end));
+            buckets[bucket_of(b)].push((b, end + 1));
+        }
+        out.push((at, buckets));
+    })
+    .into_iter()
+    .flatten()
+    {
+        by_piece[at] = buckets;
+    }
+    drop(pieces);
+    let mut bucket_keys: Vec<Vec<Key>> = vec![Vec::new(); BUCKETS];
+    let mut bucket_ends: Vec<Vec<(u32, u32)>> = vec![Vec::new(); BUCKETS];
+    for (b, keys, ends) in run_tasks(threads, BUCKETS, Vec::new, |out: &mut Vec<(usize, Vec<Key>, Vec<(u32, u32)>)>, b| {
+        let entries: usize = by_piece.iter().map(|piece| piece.get(b).map_or(0, Vec::len)).sum();
+        let mask = (entries * 2).next_power_of_two().max(16) - 1;
+        let mut table = vec![u32::MAX; mask + 1];
+        let mut keys: Vec<Key> = Vec::new();
+        let mut ends: Vec<(u32, u32)> = Vec::with_capacity(entries);
+        for piece in &by_piece {
+            let Some(list) = piece.get(b) else { continue };
+            for &(key, end) in list {
+                let mut slot = mix(key) as usize & mask;
+                let local = loop {
+                    match table[slot] {
+                        u32::MAX => {
+                            table[slot] = keys.len() as u32;
+                            keys.push(key);
+                            break keys.len() as u32 - 1;
+                        }
+                        local if keys[local as usize] == key => break local,
+                        _ => slot = (slot + 1) & mask,
+                    }
+                };
+                ends.push((end, local));
+            }
+        }
+        out.push((b, keys, ends));
+    })
+    .into_iter()
+    .flatten()
+    {
+        bucket_keys[b] = keys;
+        bucket_ends[b] = ends;
+    }
+    drop(by_piece);
+    let mut bucket_base = Vec::with_capacity(BUCKETS);
+    let mut nodes = 0usize;
+    for keys in &bucket_keys {
+        bucket_base.push(nodes as u32);
+        nodes += keys.len();
+    }
+    let node_keys: Vec<Key> = bucket_keys.into_iter().flatten().collect();
+    let ends: Vec<AtomicU32> = (0..pair_count * 2).map(|_| AtomicU32::new(0)).collect();
+    run_tasks(threads, BUCKETS, || (), |_, b| {
+        for &(end, local) in &bucket_ends[b] {
+            ends[end as usize].store(bucket_base[b] + local, Ordering::Relaxed);
+        }
+    });
+    drop(bucket_ends);
+
+    // 3. Union-find over node indices. A root is only ever re-pointed (by CAS) from itself
+    // to a smaller index, and path halving only moves pointers to ancestors, so the forest
+    // stays acyclic and every component's root ends as its smallest node index.
+    let parent: Vec<AtomicU32> = (0..nodes as u32).map(AtomicU32::new).collect();
+    fn find(parent: &[AtomicU32], mut node: u32) -> u32 {
+        loop {
+            let up = parent[node as usize].load(Ordering::Acquire);
+            if up == node {
+                return node;
+            }
+            let grand = parent[up as usize].load(Ordering::Acquire);
+            if grand != up {
+                let _ = parent[node as usize].compare_exchange_weak(up, grand, Ordering::AcqRel, Ordering::Relaxed);
+            }
             node = grand;
         }
-        node
     }
-    for (a, b) in pairs {
-        let mut intern = |k: Key| {
-            *index.entry(k).or_insert_with(|| {
-                keys.push(k);
-                parent.push(parent.len() as u32);
-                size.push(1);
-                (keys.len() - 1) as u32
-            })
-        };
-        let (a, b) = (intern(a), intern(b));
-        let (mut ra, mut rb) = (find(&mut parent, a), find(&mut parent, b));
-        if ra != rb {
-            if size[ra as usize] < size[rb as usize] {
-                std::mem::swap(&mut ra, &mut rb);
+    run_tasks(threads, pair_count.div_ceil(SPAN), || (), |_, at| {
+        for pair in at * SPAN..((at + 1) * SPAN).min(pair_count) {
+            let (mut a, mut b) = (ends[pair * 2].load(Ordering::Relaxed), ends[pair * 2 + 1].load(Ordering::Relaxed));
+            loop {
+                a = find(&parent, a);
+                b = find(&parent, b);
+                if a == b {
+                    break;
+                }
+                let (low, high) = if a < b { (a, b) } else { (b, a) };
+                if parent[high as usize].compare_exchange(high, low, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    break;
+                }
             }
-            parent[rb as usize] = ra;
-            size[ra as usize] += size[rb as usize];
         }
-    }
-    let mut smallest: Vec<Key> = keys.clone();
-    for node in 0..keys.len() {
-        let root = find(&mut parent, node as u32) as usize;
-        if key::cmp(keys[node], smallest[root], longs).is_lt() {
-            smallest[root] = keys[node];
+    });
+    drop(ends);
+
+    // 4. Name: per component, the node with the byte-wise smallest ID (a CAS minimum; IDs
+    // are distinct, so the minimum is unique whatever the order).
+    let best: Vec<AtomicU32> = (0..nodes).map(|_| AtomicU32::new(u32::MAX)).collect();
+    let roots: Vec<AtomicU32> = (0..nodes).map(|_| AtomicU32::new(0)).collect();
+    run_tasks(threads, nodes.div_ceil(SPAN), || (), |_, at| {
+        for node in at * SPAN..((at + 1) * SPAN).min(nodes) {
+            let root = find(&parent, node as u32);
+            roots[node].store(root, Ordering::Relaxed);
+            let slot = &best[root as usize];
+            let mut held = slot.load(Ordering::Acquire);
+            loop {
+                if held != u32::MAX && key::cmp(node_keys[held as usize], node_keys[node], longs).is_le() {
+                    break;
+                }
+                match slot.compare_exchange_weak(held, node as u32, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => break,
+                    Err(now) => held = now,
+                }
+            }
         }
-    }
-    let persons: Vec<Key> = (0..keys.len()).map(|node| smallest[find(&mut parent, node as u32) as usize]).collect();
-    People::new(keys.iter().copied().zip(persons))
+    });
+
+    // 5. The table: (ID, name) for every linked ID, built in parallel.
+    let pieces: Vec<Vec<(Key, Key)>> = run_tasks(threads, nodes.div_ceil(SPAN), Vec::new, |out: &mut Vec<(usize, Vec<(Key, Key)>)>, at| {
+        let range = at * SPAN..((at + 1) * SPAN).min(nodes);
+        let named = range
+            .map(|node| {
+                let root = roots[node].load(Ordering::Relaxed) as usize;
+                (node_keys[node], node_keys[best[root].load(Ordering::Relaxed) as usize])
+            })
+            .collect();
+        out.push((at, named));
+    })
+    .into_iter()
+    .flatten()
+    .map(|(_, named)| named)
+    .collect();
+    People::build(&pieces, threads)
 }
 
 // ---------------------------------------------------------------- records
@@ -836,8 +978,10 @@ fn run() -> Result<()> {
 
     let context = Context { window, products, unknown_category, campaigns, longs: LongIds::default() };
 
-    // A+B. Task 0 resolves links on one thread while the other threads parse events
-    // (largest chunks first); clicks need people, so they are parsed after.
+    // A+B. Task 0 resolves links while the other threads parse events (largest chunks
+    // first). resolve_people fans its phases out over `threads` workers of its own, so links
+    // stay off the critical path and finish in a fraction of the serial time (the brief
+    // oversubscription does not change the total work). Clicks need people: parsed after.
     let mut event_chunks = Vec::new();
     chunks_of(Kind::Event, &event_maps, &mut event_chunks);
     event_chunks.sort_by_key(|chunk| std::cmp::Reverse(chunk.end - chunk.start));
@@ -861,7 +1005,7 @@ fn run() -> Result<()> {
     };
     let parsed = run_tasks(threads, event_chunks.len() + 1, new_events, |state, at| {
         if at == 0 {
-            *people_slot.lock().unwrap() = Some(resolve_people(&link_maps, &context.longs));
+            *people_slot.lock().unwrap() = Some(resolve_people(&link_maps, threads, &context.longs));
         } else {
             parse_chunk(&context, None, &event_maps, &click_maps, event_chunks[at - 1], state);
         }
