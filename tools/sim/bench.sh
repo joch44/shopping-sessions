@@ -7,8 +7,7 @@ set -uo pipefail
 TAG=$1; CTX=$2; IMG=shopping-rust:$TAG
 RUNS=0 nolimit-run "$CTX" "$IMG" 2>&1 | grep -E "build took|FAIL|error" || true
 for ds in p20m-s11 p20m-s12 p20m-s13 f60m-s301; do
-  echo "== $ds"; DATA=/srv/nolimit/datasets/$ds RUNS=3 NOBUILD=1 nolimit-run - "$IMG" 2>/dev/null
-  sudo tar -C /srv/nolimit/run -cf /tmp/$TAG-$ds.tar output
+  echo "== $ds"; DATA=/srv/nolimit/datasets/$ds RUNS=3 NOBUILD=1 KEEP=/tmp/$TAG-$ds.tar nolimit-run - "$IMG" 2>/dev/null
 done
 id=$(sudo docker create "$IMG"); sudo docker cp "$id:/pipeline" /srv/nolimit/bin/pipeline-$TAG >/dev/null; sudo docker rm "$id" >/dev/null
 exec 9>/srv/nolimit/run.lock; flock 9; exec 8>>/tmp/feas-bench.lock; flock 8; sync; sleep 1

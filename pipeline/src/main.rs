@@ -17,6 +17,7 @@ mod hugealloc;
 mod key;
 mod output;
 mod people;
+mod scatter;
 mod ts;
 
 use std::fs::File;
@@ -31,6 +32,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::csv::{ascii_digits, data_lines, for_each_record, parse_line};
 use crate::key::{Key, LongIds, key_of, mix};
 use crate::people::People;
+use crate::scatter::Scatter;
 use crate::ts::DAY_MS;
 
 #[global_allocator]
@@ -345,8 +347,8 @@ fn person_partition(person: Key) -> usize {
 }
 
 struct ParseState {
-    events: Vec<Vec<EventCopy>>, // by event_id partition
-    clicks: Vec<Vec<Click>>,     // by person partition
+    events: Scatter<EventCopy>, // by event_id partition
+    clicks: Scatter<Click>,     // by person partition
     dates: ts::DateCache,
 }
 
@@ -372,7 +374,7 @@ fn parse_chunk(
                     Some((user, ts, price, category)) => EventCopy { id, user, seq, ingest, ts, price, category },
                     None => EventCopy { id, user: 0, seq, ingest, ts: 0, price: INVALID, category: 0 },
                 };
-                state.events[dedup_partition(id)].push(copy);
+                state.events.push(dedup_partition(id), copy);
             });
         }
         Kind::Click => {
@@ -389,7 +391,7 @@ fn parse_chunk(
                 let people = people.expect("clicks are parsed after links");
                 let person = people.get(key_of(user, Some(&context.longs)));
                 let click = Click { person, click_id: key_of(click_id, Some(&context.longs)), ts, campaign };
-                state.clicks[person_partition(person)].push(click);
+                state.clicks.push(person_partition(person), click);
             });
         }
     }
@@ -400,11 +402,17 @@ fn parse_chunk(
 /// Events step 2 for one event_id partition: per id, the copy with the smallest
 /// (ingest_ts, file position) is kept; if it is valid it survives. `pieces` are the
 /// per-thread vectors of this partition, indexed in place as (piece << 27 | index).
-fn dedup(pieces: Vec<Vec<EventCopy>>, people: &People, scratch: &mut DedupScratch, out: &mut [Vec<Event>]) {
+fn dedup(pieces: Vec<&[EventCopy]>, people: &People, scratch: &mut DedupScratch, out: &mut Scatter<Event>) {
     const SHIFT: u32 = 27;
     // Handles hold up to 31 pieces of < 2^27 copies; with more threads, merge the pieces.
-    let pieces = if pieces.len() < 32 { pieces } else { vec![pieces.into_iter().flatten().collect()] };
-    let total: usize = pieces.iter().map(Vec::len).sum();
+    let merged: Vec<EventCopy>;
+    let pieces = if pieces.len() < 32 {
+        pieces
+    } else {
+        merged = pieces.concat();
+        vec![&merged[..]]
+    };
+    let total: usize = pieces.iter().map(|piece| piece.len()).sum();
     assert!(pieces.iter().all(|p| p.len() < 1 << SHIFT), "dedup partition over 134M copies");
     let get = |handle: u32| &pieces[(handle >> SHIFT) as usize][(handle & ((1 << SHIFT) - 1)) as usize];
     // Open addressing over handles; u32::MAX is empty. Within one partition the low hash
@@ -449,7 +457,7 @@ fn dedup(pieces: Vec<Vec<EventCopy>>, people: &People, scratch: &mut DedupScratc
         }
         let copy = get(survivors[at]);
         let person = people.get(copy.user);
-        out[person_partition(person)].push(Event { person, ts: copy.ts, price: copy.price, category: copy.category });
+        out.push(person_partition(person), Event { person, ts: copy.ts, price: copy.price, category: copy.category });
     }
 }
 
@@ -572,13 +580,13 @@ fn person_sessions(person: Key, events: &[Event], clicks: &[Click], state: &mut 
 /// Reads the per-thread pieces in place; all temporary vectors live in `state.scratch`
 /// and are reused across partitions.
 fn people_partition(
-    event_pieces: Vec<Vec<Event>>,
-    click_pieces: Vec<Vec<Click>>,
+    event_pieces: Vec<&[Event]>,
+    click_pieces: Vec<&[Click]>,
     longs: &LongIds,
     state: &mut PeopleState,
     category_names: &[Vec<u8>],
 ) {
-    let total: usize = event_pieces.iter().map(Vec::len).sum();
+    let total: usize = event_pieces.iter().map(|piece| piece.len()).sum();
     if total == 0 {
         return;
     }
@@ -602,7 +610,7 @@ fn people_partition(
         }
     };
     event_group.clear();
-    for event in event_pieces.iter().flatten() {
+    for event in event_pieces.iter().copied().flatten() {
         let group = match find(table, group_keys, event.person) {
             (_, Some(group)) => group,
             (slot, None) => {
@@ -628,7 +636,7 @@ fn people_partition(
     grouped.clear();
     grouped.reserve(total);
     let spare = grouped.spare_capacity_mut();
-    for (event, &group) in event_pieces.iter().flatten().zip(event_group.iter()) {
+    for (event, &group) in event_pieces.iter().copied().flatten().zip(event_group.iter()) {
         let at = &mut cursor[group as usize];
         spare[*at as usize].write(*event);
         *at += 1;
@@ -638,7 +646,7 @@ fn people_partition(
     click_group.clear();
     click_start.clear();
     click_start.resize(groups + 1, 0);
-    for click in click_pieces.iter().flatten() {
+    for click in click_pieces.iter().copied().flatten() {
         let group = find(table, group_keys, click.person).1.unwrap_or(u32::MAX);
         click_group.push(group);
         if group != u32::MAX {
@@ -654,7 +662,7 @@ fn people_partition(
     grouped_clicks.clear();
     grouped_clicks.reserve(kept_clicks);
     let spare = grouped_clicks.spare_capacity_mut();
-    for (click, &group) in click_pieces.iter().flatten().zip(click_group.iter()) {
+    for (click, &group) in click_pieces.iter().copied().flatten().zip(click_group.iter()) {
         if group != u32::MAX {
             let at = &mut cursor[group as usize];
             spare[*at as usize].write(*click);
@@ -688,19 +696,6 @@ struct GroupScratch {
 }
 
 // ---------------------------------------------------------------- main
-
-/// [thread][partition] -> [partition] of [thread] pieces, moving the vectors.
-fn transpose<T>(per_thread: Vec<Vec<Vec<T>>>, partitions: usize) -> Vec<Mutex<Vec<Vec<T>>>> {
-    let mut by_partition: Vec<Vec<Vec<T>>> = (0..partitions).map(|_| Vec::new()).collect();
-    for thread in per_thread {
-        for (p, piece) in thread.into_iter().enumerate() {
-            if !piece.is_empty() {
-                by_partition[p].push(piece);
-            }
-        }
-    }
-    by_partition.into_iter().map(Mutex::new).collect()
-}
 
 fn run() -> Result<()> {
     let mut timer = Timer::new();
@@ -751,14 +746,15 @@ fn run() -> Result<()> {
     let per_buffer = |bytes: usize, line: usize, parts: usize| bytes / line * 115 / 100 / threads / parts;
     let event_cap = per_buffer(total_bytes(&event_maps), 77, DEDUP_PARTITIONS);
     let click_cap = per_buffer(total_bytes(&click_maps), 47, PERSON_PARTITIONS);
+    let survivor_cap = per_buffer(total_bytes(&event_maps), 77, PERSON_PARTITIONS);
     let new_events = || ParseState {
-        events: (0..DEDUP_PARTITIONS).map(|_| Vec::with_capacity(event_cap)).collect(),
-        clicks: (0..PERSON_PARTITIONS).map(|_| Vec::new()).collect(),
+        events: Scatter::new(DEDUP_PARTITIONS, event_cap),
+        clicks: Scatter::new(PERSON_PARTITIONS, 0),
         dates: ts::DateCache::default(),
     };
     let new_clicks = || ParseState {
-        events: (0..DEDUP_PARTITIONS).map(|_| Vec::new()).collect(),
-        clicks: (0..PERSON_PARTITIONS).map(|_| Vec::with_capacity(click_cap)).collect(),
+        events: Scatter::new(DEDUP_PARTITIONS, 0),
+        clicks: Scatter::new(PERSON_PARTITIONS, click_cap),
         dates: ts::DateCache::default(),
     };
     let parsed = run_tasks(threads, event_chunks.len() + 1, new_events, |state, at| {
@@ -776,24 +772,26 @@ fn run() -> Result<()> {
     let clicked = run_tasks(threads, click_chunks.len(), new_clicks, |state, at| {
         parse_chunk(&context, Some(&people), &event_maps, &click_maps, click_chunks[at], state)
     });
-    let event_parts = transpose(parsed.into_iter().map(|s| s.events).collect(), DEDUP_PARTITIONS);
-    let click_parts = transpose(clicked.into_iter().map(|s| s.clicks).collect(), PERSON_PARTITIONS);
+    let event_parts: Vec<Scatter<EventCopy>> = parsed.into_iter().map(|s| s.events).collect();
+    let click_parts: Vec<Scatter<Click>> = clicked.into_iter().map(|s| s.clicks).collect();
     timer.mark("parse clicks");
 
     // C. dedup per event_id partition.
     let deduped = run_tasks(
         threads,
         DEDUP_PARTITIONS,
-        || (DedupScratch::default(), (0..PERSON_PARTITIONS).map(|_| Vec::new()).collect::<Vec<Vec<Event>>>()),
-        |(scratch, out), p| dedup(std::mem::take(&mut *event_parts[p].lock().unwrap()), &people, scratch, out),
+        || (DedupScratch::default(), Scatter::new(PERSON_PARTITIONS, survivor_cap)),
+        |(scratch, out), p| {
+            let pieces: Vec<&[EventCopy]> = event_parts.iter().flat_map(|scatter| scatter.pieces(p)).filter(|s| !s.is_empty()).collect();
+            dedup(pieces, &people, scratch, out)
+        },
     );
-    let deduped: Vec<Vec<Vec<Event>>> = deduped.into_iter().map(|(_, out)| out).collect();
-    let person_events = transpose(deduped, PERSON_PARTITIONS);
+    let person_events: Vec<Scatter<Event>> = deduped.into_iter().map(|(_, out)| out).collect();
     timer.mark("dedup");
 
     // D. per person partition, heaviest first.
     let mut order: Vec<usize> = (0..PERSON_PARTITIONS).collect();
-    let weight = |q: usize| person_events[q].lock().unwrap().iter().map(Vec::len).sum::<usize>();
+    let weight = |q: usize| person_events.iter().map(|scatter| scatter.len(q)).sum::<usize>();
     let weights: Vec<usize> = (0..PERSON_PARTITIONS).map(weight).collect();
     order.sort_by_key(|&q| std::cmp::Reverse(weights[q]));
     let campaign_count = campaign_rows.len();
@@ -809,8 +807,8 @@ fn run() -> Result<()> {
         },
         |state, at| {
             let q = order[at];
-            let event_pieces = std::mem::take(&mut *person_events[q].lock().unwrap());
-            let click_pieces = std::mem::take(&mut *click_parts[q].lock().unwrap());
+            let event_pieces: Vec<&[Event]> = person_events.iter().flat_map(|scatter| scatter.pieces(q)).filter(|s| !s.is_empty()).collect();
+            let click_pieces: Vec<&[Click]> = click_parts.iter().flat_map(|scatter| scatter.pieces(q)).filter(|s| !s.is_empty()).collect();
             people_partition(event_pieces, click_pieces, &context.longs, state, &category_names);
         },
     );
