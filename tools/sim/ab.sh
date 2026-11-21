@@ -3,6 +3,10 @@
 # Interleaved A/B of two built images (shopping-rust:TAG) on one dataset: A, B, A, B, ...
 # one fresh container per run (nolimit-run), then medians. Interleaving cancels drift.
 set -uo pipefail
+# Hold both benchmark locks for the whole session, so no other session's run lands
+# between these runs (their memory and writeback would skew the comparison).
+exec 9>/srv/nolimit/run.lock; flock 9; exec 8>>/tmp/feas-bench.lock; flock 8
+export HOLDING_LOCKS=1
 A=$1; B=$2; DS=$3; N=${4:-5}; ta=(); tb=()
 for i in $(seq 1 "$N"); do
   for t in "$A" "$B"; do
