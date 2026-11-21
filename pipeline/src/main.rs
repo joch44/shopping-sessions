@@ -47,7 +47,7 @@ const NEVER: i64 = i64::MAX; // an unparseable ingest_ts never wins dedup and is
 pub const ORGANIC: u32 = u32::MAX; // campaign index of `organic`
 
 const DEDUP_PARTITIONS: usize = 1024; // by event_id; small enough per partition to stay in L2
-const PERSON_PARTITIONS: usize = 256; // by person
+const PERSON_PARTITIONS: usize = 1024; // by person; a partition's events + group table fit L2
 const CHUNK_BYTES: usize = 16 << 20;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -516,10 +516,64 @@ pub struct CampaignCounts {
     pub assisted: u64,
 }
 
+/// Per-thread campaign_daily counters: a dense array indexed by (campaign, day) when the
+/// window is a sane size (every session starts inside it), with a map for anything else.
+/// `organic` is the index after the last campaign.
+struct CampaignCounters {
+    dense: Vec<CampaignCounts>,
+    first_day: i64,
+    days: usize,
+    organic: u32,
+    sparse: FxHashMap<(u32, i32), CampaignCounts>,
+}
+
+impl CampaignCounters {
+    fn new(campaigns: usize, window: (i64, i64)) -> Self {
+        let first_day = window.0.div_euclid(DAY_MS);
+        let days = ((window.1 - 1).div_euclid(DAY_MS) - first_day + 1).max(1) as usize;
+        let cells = (campaigns + 1).saturating_mul(days);
+        let dense = if cells <= 8 << 20 { vec![CampaignCounts::default(); cells] } else { Vec::new() };
+        Self { dense, first_day, days, organic: campaigns as u32, sparse: FxHashMap::default() }
+    }
+
+    #[inline(always)]
+    fn at(&mut self, campaign: u32, day: i32) -> &mut CampaignCounts {
+        let index = if campaign == ORGANIC { self.organic } else { campaign };
+        let offset = i64::from(day) - self.first_day;
+        if !self.dense.is_empty() && (0..self.days as i64).contains(&offset) {
+            &mut self.dense[index as usize * self.days + offset as usize]
+        } else {
+            self.sparse.entry((campaign, day)).or_default()
+        }
+    }
+
+    /// Adds these counts into `total`, keyed as (campaign or ORGANIC, day); only touched cells.
+    fn merge_into(self, total: &mut FxHashMap<(u32, i32), CampaignCounts>) {
+        let add = |total: &mut FxHashMap<(u32, i32), CampaignCounts>, key, c: &CampaignCounts| {
+            let row = total.entry(key).or_default();
+            row.sessions += c.sessions;
+            row.purchasing += c.purchasing;
+            row.revenue += c.revenue;
+            row.assisted += c.assisted;
+        };
+        for (cell, counts) in self.dense.iter().enumerate() {
+            if counts.sessions == 0 && counts.assisted == 0 {
+                continue; // never credited nor assisted: no row
+            }
+            let (index, offset) = ((cell / self.days) as u32, (cell % self.days) as i64);
+            let campaign = if index == self.organic { ORGANIC } else { index };
+            add(total, (campaign, (self.first_day + offset) as i32), counts);
+        }
+        for (key, counts) in &self.sparse {
+            add(total, *key, counts);
+        }
+    }
+}
+
 struct PeopleState {
     scratch: GroupScratch,
     user_rows: Vec<UserRow>,
-    campaign_daily: FxHashMap<(u32, i32), CampaignCounts>,
+    campaign_daily: CampaignCounters,
     assist_stamp: Vec<u64>,
     session_number: u64,
 }
@@ -589,14 +643,14 @@ fn person_sessions(person: Key, events: &[Event], clicks: &[Click], state: &mut 
                 let stamp = &mut state.assist_stamp[click.campaign as usize];
                 if *stamp != state.session_number {
                     *stamp = state.session_number;
-                    state.campaign_daily.entry((click.campaign, day)).or_default().assisted += 1;
+                    state.campaign_daily.at(click.campaign, day).assisted += 1;
                 }
             }
             clicks[first_latest].campaign
         } else {
             ORGANIC // step 5
         };
-        let row = state.campaign_daily.entry((credited, day)).or_default();
+        let row = state.campaign_daily.at(credited, day);
         row.sessions += 1;
         row.purchasing += u64::from(purchased);
         row.revenue += revenue;
@@ -831,7 +885,7 @@ fn run() -> Result<()> {
         || PeopleState {
             scratch: GroupScratch::default(),
             user_rows: Vec::new(),
-            campaign_daily: FxHashMap::default(),
+            campaign_daily: CampaignCounters::new(campaign_count, context.window),
             assist_stamp: vec![u64::MAX; campaign_count],
             session_number: 0,
         },
@@ -849,13 +903,7 @@ fn run() -> Result<()> {
     let mut campaign_daily: FxHashMap<(u32, i32), CampaignCounts> = FxHashMap::default();
     let mut user_parts = Vec::new();
     for state in states {
-        for (key, counts) in state.campaign_daily {
-            let row = campaign_daily.entry(key).or_default();
-            row.sessions += counts.sessions;
-            row.purchasing += counts.purchasing;
-            row.revenue += counts.revenue;
-            row.assisted += counts.assisted;
-        }
+        state.campaign_daily.merge_into(&mut campaign_daily);
         if !state.user_rows.is_empty() {
             user_parts.push(state.user_rows);
         }
