@@ -277,19 +277,23 @@ pub struct Sample {
 }
 
 impl Sample {
-    pub fn add_event_lines(&mut self, bytes: &[u8], max: usize) {
+    /// Adds decodable event rows; returns how many well-formed lines it looked at.
+    pub fn add_event_lines(&mut self, bytes: &[u8], max: usize) -> usize {
         let mut f: [&[u8]; 7] = [&[]; 7];
+        let mut seen = 0;
         for line in bytes.split(|&c| c == b'\n') {
             if self.events.len() >= max {
-                return;
+                return seen;
             }
             if !split_line(line, &mut f) {
                 continue;
             }
+            seen += 1;
             if let Some(id) = id_x(f[0], b'e') {
                 self.events.push(EventRow { id_x: id, user_x: id_x(f[1], b'u'), ts: parse_ts(f[2]) });
             }
         }
+        seen
     }
     pub fn add_click_lines(&mut self, bytes: &[u8], max: usize) {
         let mut f: [&[u8]; 4] = [&[]; 4];
