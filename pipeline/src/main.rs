@@ -1732,7 +1732,11 @@ fn main() {
     // GCP n2 Cascade Lake VM). Output is unaffected.
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {
-        libc::mallopt(libc::M_ARENA_MAX, 1);
+        // ONE_ARENA=0 keeps glibc's per-thread arenas (A/B on kernels with per-VMA locks:
+        // analysis VM, kernel 7.0, 60M normal -2.5%).
+        if std::env::var("ONE_ARENA").as_deref() != Ok("0") {
+            libc::mallopt(libc::M_ARENA_MAX, 1);
+        }
         libc::mallopt(libc::M_TOP_PAD, 64 << 20);
         // Keep blocks under 64 MiB in the heap and never trim it: fewer mmap/munmap writers
         // (research session; GCP 60M 3.47 -> 3.22 s, 20M and Azure neutral).
