@@ -377,6 +377,7 @@ fn parse_chunk(
                 };
                 state.events.push(dedup_partition(id), copy);
             });
+            crate::scatter::fence(); // the arena is read by other threads in dedup
         }
         Kind::Click => {
             let people = people.expect("clicks are parsed after links");
