@@ -1307,49 +1307,14 @@ fn run() -> Result<()> {
     }
     timer.mark("parquet");
     // Every output is written and closed. Exit here, before this frame's locals drop:
-    // returning would unmap the arenas and input mappings one by one on this thread
-    // (~120 ms at 20M per strace; idea and measurement from the scouter session).
-    parallel_teardown(threads);
+    // returning would unmap the arenas and input mappings one by one on this thread.
+    // (v26's parallel MADV_DONTNEED teardown is gone: it released every /proc/self/maps region
+    // over 64 MiB, and the kernel merges adjacent mappings with equal flags, so such a region
+    // can include glibc heaps or thread stacks still in use; a no-THP build segfaulted
+    // (jump to address 0) on the GCP VM. It saved only 0.01-0.035 s.)
     std::process::exit(0);
 }
 
-/// The kernel tears an address space down on one thread (munmap on drop, or at exit).
-/// Release every big region (> 64 MiB; glibc thread arenas are exactly 64 MiB and stay) in
-/// 32 MiB slices with MADV_DONTNEED from all threads first; parallel munmap would not help
-/// (it takes the mmap lock for writing). Called only after every output file is closed:
-/// nothing reads this memory again. Read-only input mappings just lose their page tables.
-fn parallel_teardown(threads: usize) {
-    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else { return };
-    const SLICE: usize = 32 << 20;
-    let mut slices: Vec<(usize, usize)> = Vec::with_capacity(1024);
-    for line in maps.lines() {
-        if line.contains('[') {
-            continue; // [stack], [heap], [vdso], [vvar]
-        }
-        let Some((a, b)) = line.split(' ').next().and_then(|range| range.split_once('-')) else { continue };
-        let (Ok(a), Ok(b)) = (usize::from_str_radix(a, 16), usize::from_str_radix(b, 16)) else { continue };
-        if b - a <= 64 << 20 {
-            continue;
-        }
-        let mut p = a;
-        while p < b {
-            let len = SLICE.min(b - p);
-            slices.push((p, len));
-            p += len;
-        }
-    }
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        for _ in 0..threads.clamp(1, 16) {
-            scope.spawn(|| loop {
-                let at = next.fetch_add(1, Ordering::Relaxed);
-                let Some(&(p, len)) = slices.get(at) else { break };
-                // SAFETY: called after the last use of any memory in these regions.
-                unsafe { libc::madvise(p as *mut libc::c_void, len, libc::MADV_DONTNEED) };
-            });
-        }
-    });
-}
 
 fn main() {
     match run() {
