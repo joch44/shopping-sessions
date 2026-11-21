@@ -70,6 +70,9 @@ Calibration: v9 mirror 2.24 s vs grader 1.97 s -> factor 0.878 (tools/to_board.p
 Lessons: analysis-VM (Zen 5, 16 cores) gains roughly halve on the mirror (Ice Lake, 4 cores x 2 HT);
 memory-layout changes must be A/B'd on the mirror, interleaved (run-to-run drift is ~2-4%).
 
+Rejected (measured, scouter session, analysis VM): two-pass events (competitor design: pass 1 dedups
+on event_id only, pass 2 parses winners straight into person shards): outputs correct but 20M +0.11 s,
+60M +0.28 s. Prototype kept on branch scout-twopass for the record.
 Rejected (measured, mirror, interleaved vs v25): mimalloc as the only allocator (20M 1.377 vs 1.365 s,
 60M 3.74 vs 3.70 s) and HugeAlloc >= 16 MiB + mimalloc for small (20M 1.380 vs 1.385 tie, 60M 3.62 vs
 3.56 s); the analysis-VM gain (-5.8%, faster end-of-run frees) does not transfer to Ice Lake.
