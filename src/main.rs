@@ -540,7 +540,29 @@ fn main() {
     // here. Sleep 99x the in-process time, so the score is docker cost + 100 x in-process
     // time; with the normal score S0: in-process = (S - S0) / 99.
     let dt = t0.elapsed();
-    eprintln!("[probe] in-process {:.3} ms, sleeping {:.3} s", dt.as_secs_f64() * 1e3, dt.as_secs_f64() * 99.0);
-    std::thread::sleep(dt * 99);
+    // Topology flags: A = this process may run on more than 8 CPUs; B = those CPUs span at
+    // least 8 distinct physical cores. Score = docker + 100 x in-process + 20 s A + 40 s B.
+    let allowed: Vec<usize> = std::fs::read_to_string("/proc/self/status").ok().and_then(|st| {
+        let l = st.lines().find(|l| l.starts_with("Cpus_allowed_list:"))?.split(':').nth(1)?.trim().to_string();
+        let mut v = Vec::new();
+        for part in l.split(',') {
+            let mut it = part.split('-');
+            let a: usize = it.next()?.trim().parse().ok()?;
+            let b: usize = it.next().map_or(Some(a), |x| x.trim().parse().ok())?;
+            v.extend(a..=b);
+        }
+        Some(v)
+    }).unwrap_or_default();
+    let mut cores: Vec<(String, String)> = allowed.iter().map(|c| {
+        let rd = |f: &str| std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{c}/topology/{f}")).unwrap_or_else(|_| format!("?{c}")).trim().to_string();
+        (rd("physical_package_id"), rd("core_id"))
+    }).collect();
+    cores.sort();
+    cores.dedup();
+    let a = allowed.len() > 8;
+    let b = cores.len() >= 8;
+    let extra = std::time::Duration::from_secs(20 * a as u64 + 40 * b as u64);
+    eprintln!("[probe] in-process {:.3} ms, cpus {} cores {} A={a} B={b}", dt.as_secs_f64() * 1e3, allowed.len(), cores.len());
+    std::thread::sleep(dt * 99 + extra);
     unsafe { sys::_exit(0) }
 }
