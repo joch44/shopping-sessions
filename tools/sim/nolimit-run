@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Usage: nolimit-run <build-context-dir|-> [tag]
+#   DATA=/srv/nolimit/datasets/<name>   dataset (default /srv/nolimit/data)
+#   NOBUILD=1                            reuse the tag, skip the build ("-" as context)
+#   RUNS=N                               time N runs (fresh container each)
+#   COLD=1                               drop the page cache before each run
+# Mirrors the scorer: amd64 build (<=10 min), image <=8 GB, then offline runs with
+# 8 CPUs, 24 GB no swap, read-only rootfs, 64 MB /tmp, uid 1000, cap-drop ALL,
+# no-new-privileges, 4096 pids, /data ro, /output+/scratch on a 50 GB fs.
+# Prints one line per run: "RUN <n> wall_s=<seconds> exit=<code>" on stdout.
+set -euo pipefail
+CTX=${1:?usage: nolimit-run <build-context-dir|-> [tag]}; TAG=${2:-nolimit-sub:latest}
+DATA=${DATA:-/srv/nolimit/data}; RUNS=${RUNS:-1}
+RUN=/srv/nolimit/run; LOGS=$HOME/nolimit-logs/$(date +%Y%m%d-%H%M%S); mkdir -p "$LOGS"
+# One harness at a time: overlapping runs share /srv/nolimit/run, delete each
+# other's output and spoil each other's timings.
+# HOLDING_LOCKS=1: the caller already holds both locks for a whole session of runs.
+if [ "${HOLDING_LOCKS:-0}" != 1 ]; then
+exec 9>/srv/nolimit/run.lock
+if ! flock -n 9; then echo ">> another nolimit-run is active; waiting for it" >&2; flock 9; fi
+# Also share the lock other sessions use for benchmarks on this VM, so timings never overlap.
+exec 8>>/tmp/feas-bench.lock
+if ! flock -n 8; then echo ">> another session is benchmarking (/tmp/feas-bench.lock); waiting" >&2; flock 8; fi
+fi
+
+if [ "${NOBUILD:-0}" != 1 ]; then
+  echo ">> build" >&2; t0=$(date +%s)
+  timeout 600 sudo docker buildx build --platform linux/amd64 --load -t "$TAG" "$CTX" >"$LOGS/build.log" 2>&1 \
+    || { tail -20 "$LOGS/build.log" >&2; echo "!! BUILD FAILED or over 10 min" >&2; exit 1; }
+  echo ">> build took $(( $(date +%s) - t0 ))s" >&2
+fi
+arch=$(sudo docker image inspect "$TAG" --format '{{.Architecture}}'); size=$(sudo docker image inspect "$TAG" --format '{{.Size}}')
+[ "$arch" = amd64 ] || { echo "!! image is not amd64" >&2; exit 1; }
+[ "$size" -le $((8*1024*1024*1024)) ] || { echo "!! image over 8 GB" >&2; exit 1; }
+
+rc_all=0
+for n in $(seq 1 "$RUNS"); do
+  sudo rm -rf "$RUN/output" "$RUN/scratch"; sudo install -d -o 1000 -g 1000 "$RUN/output" "$RUN/scratch"
+  # Flush pending writes first (builds, earlier outputs): background writeback on this
+  # VM's ~0.9 GB/s disk otherwise steals seconds from the timed run.
+  sync; sleep 1
+  [ "${COLD:-0}" = 1 ] && { sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null; }
+  t0=$(date +%s.%N); set +e
+  sudo docker run --rm --platform linux/amd64 --network none \
+    --cpuset-cpus 0-7 --cpus 8 --memory 24g --memory-swap 24g \
+    --read-only --tmpfs /tmp:rw,size=64m,mode=1777 --user 1000:1000 \
+    --pids-limit 4096 --cap-drop ALL --security-opt no-new-privileges \
+    -v "$DATA":/data:ro -v "$RUN/output":/output -v "$RUN/scratch":/scratch \
+    -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch -e NCPU=8 -e MEM_GB=24 \
+    "$TAG" 2>"$LOGS/stderr.$n.log" >"$LOGS/stdout.$n.log"
+  rc=$?; set -e; t1=$(date +%s.%N)
+  wall=$(echo "$t1 - $t0" | bc)
+  echo "RUN $n wall_s=$wall exit=$rc"
+  [ $rc -eq 137 ] && echo "!! exit 137: likely OOM-killed" >&2
+  [ "$(stat -c %s "$LOGS/stdout.$n.log")" -le $((50*1024*1024)) ] || echo "!! stdout over 50 MB" >&2
+  [ $rc -eq 0 ] || rc_all=$rc
+done
+# KEEP=/path.tar saves the last run's output while the lock is still held (another
+# session's run could otherwise replace it before the caller copies it).
+[ -n "${KEEP:-}" ] && sudo tar -C "$RUN" -cf "$KEEP" output
+echo ">> output left in $RUN/output; logs in $LOGS" >&2
+exit $rc_all
