@@ -67,7 +67,8 @@ Mirror VM: 3.01 s @20M, 8.81 s @60M. All outputs match.
 | v27 | partition counts from input size (4096 above ~30M events) + dedup table index above partition bits | | | 60M stage A/B: dedup 0.81 -> 0.69, sessions 0.71 -> 0.64 |
 | v28 | scouter: products loader, parallel startup, counter merge on writer thread, 4 MiB click chunks, CLICK_BATCH 64 | | | |
 | v29 | research: incremental assists window | 1.30 | 3.26 | interleaved vs v26: 1.348 / 3.596 (-0.34 s at 60M) |
-| v30 | research ts32 sessions (u32 offsets, i64 fallback for long windows added here) + plain click keys | PENDING | | |
+| v30 | research ts32 sessions (u32 offsets, i64 fallback for long windows added here) + plain click keys | 1.27 | 3.29 | interleaved vs v29: 1.303 / 3.321 |
+| v31 | research one-pass grouping in sessions | PENDING | | research: sessions 0.201 -> 0.192 / 0.579 -> 0.540 |
 
 Calibration: v9 mirror 2.24 s vs grader 1.97 s -> factor 0.878 (tools/to_board.py). Target <1.0 s grader
 ~= 1.1 s mirror. Container start/stop floor ~0.34 s (research): in-process budget ~0.75 s @20M.
@@ -75,6 +76,9 @@ Calibration: v9 mirror 2.24 s vs grader 1.97 s -> factor 0.878 (tools/to_board.p
 Lessons: analysis-VM (Zen 5, 16 cores) gains roughly halve on the mirror (Ice Lake, 4 cores x 2 HT);
 memory-layout changes must be A/B'd on the mirror, interleaved (run-to-run drift is ~2-4%).
 
+Rejected (GRADER, communicator session): AVX2-only build of v30 + AVX2 paths (af52350, target
+x86-64-v3) scored 1.21 s vs v25's 1.18 s with AVX-512: AVX-512 frequency licensing is not the gap
+to the 0.84 s competitor. Master stays cascadelake/AVX-512; the AVX2 paths remain as fallback code.
 Rejected (measured, mirror, interleaved vs v29): click parsing and dedup interleaved in one pool for
 hyperthread mixing (20M 1.288 -> 1.316 s, 60M 3.29 -> 3.32 s; outputs correct).
 Rejected (measured, research, mirror): sequential-append dedup (+0.075 s @20M, +0.11 s @60M).
