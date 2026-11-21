@@ -1,4 +1,4 @@
-//! Global allocator: allocations of 1 MiB or more come from their own 2 MiB-aligned
+//! Global allocator: allocations of 16 MiB or more come from their own 2 MiB-aligned
 //! anonymous mapping marked MADV_HUGEPAGE (transparent huge pages; a no-op where THP is
 //! off), grown in place or moved by mremap without copying. Everything smaller goes to
 //! the system allocator. Huge pages cut page faults ~500x for the big partition buffers
@@ -6,7 +6,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 
-const BIG: usize = 1 << 20;
+const BIG: usize = 16 << 20;
 const HUGE: usize = 2 << 20;
 
 pub struct HugeAlloc;
