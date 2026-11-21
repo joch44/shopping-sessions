@@ -13,6 +13,7 @@
 //! times on stderr). Nothing is printed to stdout.
 
 mod csv;
+mod hugealloc;
 mod key;
 mod output;
 mod people;
@@ -31,6 +32,9 @@ use crate::csv::{ascii_digits, data_lines, for_each_record, parse_line};
 use crate::key::{Key, LongIds, key_of, mix};
 use crate::people::People;
 use crate::ts::DAY_MS;
+
+#[global_allocator]
+static ALLOCATOR: hugealloc::HugeAlloc = hugealloc::HugeAlloc;
 
 const SESSION_GAP_MS: i64 = 1_800_000; // a gap OVER this starts a new session
 const CLICK_REACH_MS: i64 = 7 * DAY_MS; // a click reaches sessions up to 7 days later
