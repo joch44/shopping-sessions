@@ -34,7 +34,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::csv::{ascii_digits, data_lines, for_each_record, parse_line};
 use crate::compact::EventCopy32;
-use crate::key::{Key, LongIds, key_of, key_of_deferred, mix};
+use crate::key::{Key, LongIds, key_of, key_of_deferred, key_of_deferred_once, mix};
 use crate::people::People;
 use crate::blocks::BlockScatter;
 use crate::scatter::Scatter;
@@ -692,9 +692,12 @@ fn parse_chunk(
                     return;
                 }
                 // The person lookup misses the cache: prefetch now, resolve when the batch fills.
-                let user = key_of_deferred(user, &context.longs);
+                // A click's user_id never needs its bytes: a person is named by an ID from the
+                // links (recorded there) or from their events (a person with no events has no
+                // output row), so long click user IDs are hashed only, not recorded.
+                let user = key_of(user, None);
                 people.prefetch(user);
-                pending.push((user, Click { person: 0, click_id: key_of_deferred(click_id, &context.longs), ts, campaign }));
+                pending.push((user, Click { person: 0, click_id: key_of_deferred_once(click_id, &context.longs), ts, campaign }));
                 if pending.len() == CLICK_BATCH {
                     flush_clicks(people, &mut pending, &mut state.clicks);
                 }
@@ -1541,7 +1544,7 @@ fn run() -> Result<()> {
             user_parts.push(state.user_rows);
         }
     }
-    let name = |person: Key| context.longs.bytes(person);
+    let name_into = |person: Key, out: &mut Vec<u8>| context.longs.append_bytes(person, out);
     let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
     // At most one thread per user_daily part (<= NCPU, one per sessions worker); the small
     // campaign_daily merge + write runs after the last part on that part's thread, so the
@@ -1560,11 +1563,11 @@ fn run() -> Result<()> {
     std::thread::scope(|scope| {
         let last = user_parts.len().saturating_sub(1);
         for (n, rows) in user_parts.iter().enumerate() {
-            let (out, name, category_names, failures, campaign_job, write_campaign) =
-                (&out, &name, &category_names, &failures, &campaign_job, &write_campaign);
+            let (out, name_into, category_names, failures, campaign_job, write_campaign) =
+                (&out, &name_into, &category_names, &failures, &campaign_job, &write_campaign);
             scope.spawn(move || {
                 let path = out.join(format!("user_daily/part-{n:05}.parquet"));
-                if let Err(error) = output::write_user_daily_fast(&path, rows, name, category_names) {
+                if let Err(error) = output::write_user_daily_fast(&path, rows, name_into, category_names) {
                     failures.lock().unwrap().push(error.to_string());
                 }
                 if n == last {
@@ -1583,7 +1586,7 @@ fn run() -> Result<()> {
         return Err(error.into());
     }
     if user_parts.is_empty() {
-        output::write_user_daily_fast(&out.join("user_daily/part-00000.parquet"), &[], &name, &category_names)?;
+        output::write_user_daily_fast(&out.join("user_daily/part-00000.parquet"), &[], &name_into, &category_names)?;
     }
     timer.mark("parquet");
     // Every output is written and closed. Exit here, before this frame's locals drop:
