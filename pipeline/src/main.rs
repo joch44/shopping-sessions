@@ -378,6 +378,8 @@ fn parse_chunk(
             });
         }
         Kind::Click => {
+            let people = people.expect("clicks are parsed after links");
+            let mut pending: Vec<(Key, Click)> = Vec::with_capacity(CLICK_BATCH);
             for_each_record::<4>(bytes_of(&click_maps[chunk.file]), chunk.start, chunk.end, |fields, _| {
                 // Steps 2-3. Dedup is skipped: copies of a click have identical values, so a
                 // duplicate can change neither the credited click nor the set of assisting
@@ -388,12 +390,28 @@ fn parse_chunk(
                 if ts < start_ms || ts >= end_ms {
                     return;
                 }
-                let people = people.expect("clicks are parsed after links");
-                let person = people.get(key_of(user, Some(&context.longs)));
-                let click = Click { person, click_id: key_of(click_id, Some(&context.longs)), ts, campaign };
-                state.clicks.push(person_partition(person), click);
+                // The person lookup misses the cache: prefetch now, resolve when the batch fills.
+                let user = key_of(user, Some(&context.longs));
+                people.prefetch(user);
+                pending.push((user, Click { person: 0, click_id: key_of(click_id, Some(&context.longs)), ts, campaign }));
+                if pending.len() == CLICK_BATCH {
+                    flush_clicks(people, &mut pending, &mut state.clicks);
+                }
             });
+            flush_clicks(people, &mut pending, &mut state.clicks);
         }
+    }
+}
+
+const CLICK_BATCH: usize = 32;
+
+/// Resolves a batch of clicks' persons (prefetched when they entered the batch) and
+/// scatters them by person.
+#[inline]
+fn flush_clicks(people: &People, pending: &mut Vec<(Key, Click)>, out: &mut Scatter<Click>) {
+    for (user, mut click) in pending.drain(..) {
+        click.person = people.get(user);
+        out.push(person_partition(click.person), click);
     }
 }
 
