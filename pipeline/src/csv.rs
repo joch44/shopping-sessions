@@ -63,10 +63,10 @@ pub fn for_each_record<'a, const N: usize>(
     let mut pos = newline + 1;
     let mut fields: [Option<&'a [u8]>; N] = [None; N];
     while pos < end && pos < data.len() {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+        #[cfg(all(target_arch = "x86_64", any(target_feature = "avx512bw", target_feature = "avx2"), target_feature = "bmi2"))]
         {
             let remaining = data.len() - pos;
-            // SAFETY: masked loads read only bytes in pos..data.len(); avx512bw is enabled.
+            // SAFETY: masks128 reads only bytes in pos..data.len() (see its two versions).
             let (newlines, commas, quotes) = unsafe { masks128(data.as_ptr().add(pos), remaining) };
             if newlines != 0 || remaining < 128 {
                 let n = if newlines != 0 { newlines.trailing_zeros() as usize } else { remaining };
@@ -88,7 +88,32 @@ pub fn for_each_record<'a, const N: usize>(
 }
 
 
-/// `split_masked`'s rule, writing unquoted (start, end) offsets instead of slices.
+/// AVX2 version (builds without AVX-512): four 32-byte compares. AVX2 has no byte-masked
+/// loads, so a line within 128 bytes of the end of `data` is copied into a zeroed buffer
+/// first (zero bytes match none of `\n` `,` `"`); everything else is loaded in place.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512bw")))]
+#[inline(always)]
+unsafe fn masks128(p: *const u8, remaining: usize) -> (u128, u128, u128) {
+    use std::arch::x86_64::*;
+    let mut tail = [0u8; 128];
+    let base = if remaining >= 128 {
+        p
+    } else {
+        // SAFETY: p..p+remaining is in bounds; tail holds 128 bytes.
+        unsafe { std::ptr::copy_nonoverlapping(p, tail.as_mut_ptr(), remaining) };
+        tail.as_ptr()
+    };
+    unsafe {
+        let blocks = [0, 32, 64, 96].map(|at| _mm256_loadu_si256(base.add(at).cast()));
+        let eq = |byte: u8| {
+            let x = _mm256_set1_epi8(byte as i8);
+            blocks.iter().enumerate().fold(0u128, |mask, (i, block)| {
+                mask | u128::from(_mm256_movemask_epi8(_mm256_cmpeq_epi8(*block, x)) as u32) << (32 * i)
+            })
+        };
+        (eq(b'\n'), eq(b','), eq(b'"'))
+    }
+}
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
 #[inline(always)]
@@ -118,7 +143,7 @@ unsafe fn masks128(p: *const u8, remaining: usize) -> (u128, u128, u128) {
 /// (a field starts with a quote iff it ends with one). A 1-byte field `"` (its quote in both
 /// SQ and EQ) is rejected outright, so no quote is counted twice; then every quote must be
 /// one of those: popcount(quotes) == |SQ| + |EQ| rejects any other quote in the line.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "bmi2"))]
+#[cfg(all(target_arch = "x86_64", any(target_feature = "avx512bw", target_feature = "avx2"), target_feature = "bmi2"))]
 #[inline(always)]
 fn split_masked<'a, const N: usize>(line: &'a [u8], commas: u128, quotes: u128, out: &mut [Option<&'a [u8]>; N]) -> bool {
     use std::arch::x86_64::_pext_u64;

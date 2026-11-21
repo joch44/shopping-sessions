@@ -53,6 +53,22 @@ impl<T: Copy> Scatter<T> {
                     return;
                 }
             }
+            // AVX2 build: the same non-temporal store as two 32-byte halves.
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512f")))]
+            if std::mem::size_of::<T>() == 64 {
+                let slot = self.data.as_mut_ptr().wrapping_add(part * self.cap + len);
+                if slot as usize % 64 == 0 {
+                    // SAFETY: as above; two aligned 32-byte stores cover the 64-byte item.
+                    unsafe {
+                        use std::arch::x86_64::{__m256i, _mm256_stream_si256};
+                        let halves = std::mem::transmute_copy::<T, [__m256i; 2]>(&item);
+                        _mm256_stream_si256(slot.cast(), halves[0]);
+                        _mm256_stream_si256(slot.cast::<__m256i>().add(1), halves[1]);
+                    }
+                    self.lens[part] = len + 1;
+                    return;
+                }
+            }
             self.data[part * self.cap + len].write(item);
             self.lens[part] = len + 1;
         } else {
