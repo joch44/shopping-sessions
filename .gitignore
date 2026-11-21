@@ -1,1 +1,5 @@
 target
+
+# Notes stay private: no markdown is tracked except the root README (credits).
+*.md
+!/README.md
