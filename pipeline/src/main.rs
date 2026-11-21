@@ -974,7 +974,7 @@ fn people_partition<T: TsOffset>(
         return;
     }
     let mut scratch = std::mem::take(T::scratch(state));
-    let GroupScratch { table, group_keys, event_group, event_start, cursor, click_group, click_start, grouped_clicks, grouped_ts, purchase_start, grouped_purchases } =
+    let GroupScratch { table, group_keys, event_start, cursor, click_group, click_start, grouped_clicks, grouped_ts, purchase_start, grouped_purchases, keyed, keyed_purchases } =
         &mut scratch;
     // person -> group number, open addressing over group numbers (u32::MAX = empty).
     let slots = (total * 2).next_power_of_two().max(16);
@@ -992,7 +992,12 @@ fn people_partition<T: TsOffset>(
             }
         }
     };
-    event_group.clear();
+    // One pass over the survivors (they come from DRAM): each event's group and ts offset go
+    // into an L2-sized temporary, purchases with their group into another; the counting sorts
+    // below read only these, not the survivors a second time (mirror: sessions -0.013 s @20M,
+    // -0.043 s @60M).
+    keyed.clear();
+    keyed_purchases.clear();
     for event in event_pieces.iter().copied().flatten() {
         let group = match find(table, group_keys, event.person) {
             (_, Some(group)) => group,
@@ -1002,13 +1007,17 @@ fn people_partition<T: TsOffset>(
                 (group_keys.len() - 1) as u32
             }
         };
-        event_group.push(group);
+        let ts_rel = T::from_rel(event.ts - window_start);
+        keyed.push((group, ts_rel));
+        if event.price > 0 {
+            keyed_purchases.push((group, Purchase { ts: ts_rel, price: event.price, category: event.category }));
+        }
     }
     let groups = group_keys.len();
     // Counting sort of events, then of clicks, into group order.
     event_start.clear();
     event_start.resize(groups + 1, 0);
-    for &group in event_group.iter() {
+    for &(group, _) in keyed.iter() {
         event_start[group as usize + 1] += 1;
     }
     for g in 0..groups {
@@ -1022,11 +1031,13 @@ fn people_partition<T: TsOffset>(
     grouped_ts.clear();
     grouped_ts.reserve(total);
     let spare = grouped_ts.spare_capacity_mut();
-    for (event, &group) in event_pieces.iter().copied().flatten().zip(event_group.iter()) {
+    for &(group, ts_rel) in keyed.iter() {
         let at = &mut cursor[group as usize];
-        spare[*at as usize].write(T::from_rel(event.ts - window_start));
+        spare[*at as usize].write(ts_rel);
         *at += 1;
-        purchase_start[group as usize + 1] += u32::from(event.price > 0);
+    }
+    for &(group, _) in keyed_purchases.iter() {
+        purchase_start[group as usize + 1] += 1;
     }
     // SAFETY: the counting sort wrote every slot in 0..total exactly once.
     unsafe { grouped_ts.set_len(total) };
@@ -1039,12 +1050,10 @@ fn people_partition<T: TsOffset>(
     grouped_purchases.clear();
     grouped_purchases.reserve(purchase_total);
     let spare = grouped_purchases.spare_capacity_mut();
-    for (event, &group) in event_pieces.iter().copied().flatten().zip(event_group.iter()) {
-        if event.price > 0 {
-            let at = &mut cursor[group as usize];
-            spare[*at as usize].write(Purchase { ts: T::from_rel(event.ts - window_start), price: event.price, category: event.category });
-            *at += 1;
-        }
+    for &(group, purchase) in keyed_purchases.iter() {
+        let at = &mut cursor[group as usize];
+        spare[*at as usize].write(purchase);
+        *at += 1;
     }
     // SAFETY: as above, for the purchases.
     unsafe { grouped_purchases.set_len(purchase_total) };
@@ -1100,12 +1109,13 @@ fn people_partition<T: TsOffset>(
 struct GroupScratch<T> {
     table: Vec<u32>,
     group_keys: Vec<Key>,
-    event_group: Vec<u32>,
     event_start: Vec<u32>,
     cursor: Vec<u32>,
     grouped_ts: Vec<T>,
     purchase_start: Vec<u32>,
     grouped_purchases: Vec<Purchase<T>>,
+    keyed: Vec<(u32, T)>,
+    keyed_purchases: Vec<(u32, Purchase<T>)>,
     click_group: Vec<u32>,
     click_start: Vec<u32>,
     grouped_clicks: Vec<SessionClick>,
