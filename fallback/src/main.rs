@@ -1414,11 +1414,14 @@ fn run() -> Result<()> {
     };
     let parsed = run_tasks(threads, event_chunks.len() + 1, new_events, |state, at| {
         if at == 0 {
-            // The link phases run inline on this task's thread: the other pool threads are busy
-            // parsing, so their own workers would put more than NCPU threads in the runqueue.
-            // Under the scorer's `--cpus 8` (a CFS quota, no cpuset) that burns the quota early
-            // in each period and throttles every thread. LINK_THREADS overrides (experiments).
-            let link_threads = std::env::var("LINK_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0).unwrap_or(1);
+            // The link phases run on this task's thread plus one more: the other pool threads are
+            // busy parsing, so more link workers would put well over NCPU threads in the
+            // runqueue. Under the scorer's `--cpus 8` (a CFS quota, no cpuset) that burns the
+            // quota early in each period and throttles every thread. GCP replica, 60M with
+            // 17-byte user IDs (links on the critical path): 1/2/4/8 link threads -> 6.21/5.12/
+            // 5.11/5.24 s with 77/127/846/945 ms throttled; normal data never runs this code.
+            // LINK_THREADS overrides (experiments).
+            let link_threads = std::env::var("LINK_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0).unwrap_or(2);
             *people_slot.lock().unwrap() = Some(resolve_people(&link_maps, link_threads, &context.longs));
         } else {
             parse_chunk(&context, None, &event_maps, &click_maps, event_chunks[at - 1], state);
