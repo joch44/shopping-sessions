@@ -12,22 +12,34 @@ pub fn parse_line<'a, const N: usize>(line: &'a [u8], out: &mut [Option<&'a [u8]
     if line.is_empty() {
         return false;
     }
+    // One pass: find the commas, and remember whether the current field held a quote.
     let mut count = 0;
-    for field in line.split(|&byte| byte == b',') {
-        if count == N {
-            return false; // too many fields
-        }
-        let value = if field.contains(&b'"') {
-            let n = field.len();
-            if n < 2 || field[0] != b'"' || field[n - 1] != b'"' || field[1..n - 1].contains(&b'"') {
-                return false;
+    let mut start = 0;
+    let mut quoted = false;
+    let mut at = 0;
+    while at <= line.len() {
+        let byte = if at < line.len() { line[at] } else { b',' }; // the line end closes the last field
+        if byte == b',' {
+            if count == N {
+                return false; // too many fields
             }
-            &field[1..n - 1]
-        } else {
-            field
-        };
-        out[count] = if value.is_empty() { None } else { Some(value) };
-        count += 1;
+            let mut field = &line[start..at];
+            if quoted {
+                // Quotes are allowed only as the first and last byte of the whole field.
+                let n = field.len();
+                if n < 2 || field[0] != b'"' || field[n - 1] != b'"' || field[1..n - 1].contains(&b'"') {
+                    return false;
+                }
+                field = &field[1..n - 1];
+            }
+            out[count] = if field.is_empty() { None } else { Some(field) };
+            count += 1;
+            start = at + 1;
+            quoted = false;
+        } else if byte == b'"' {
+            quoted = true;
+        }
+        at += 1;
     }
     count == N
 }

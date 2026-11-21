@@ -28,28 +28,38 @@ pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + day_of_era - 719_468
 }
 
-thread_local! {
-    // A window holds few dates: remember the last one converted.
-    static LAST_DATE: std::cell::Cell<(i64, i64)> = const { std::cell::Cell::new((i64::MIN, 0)) };
+/// The last date converted: a window holds few dates.
+pub struct DateCache {
+    packed: i64,
+    days: i64,
 }
 
-#[inline]
-fn days_cached(year: i64, month: i64, day: i64) -> i64 {
-    let packed = (year << 9) | (month << 5) | day;
-    LAST_DATE.with(|last| {
-        let (key, days) = last.get();
-        if key == packed {
-            days
-        } else {
-            let days = days_from_civil(year, month, day);
-            last.set((packed, days));
-            days
+impl Default for DateCache {
+    fn default() -> Self {
+        Self { packed: i64::MIN, days: 0 }
+    }
+}
+
+impl DateCache {
+    #[inline]
+    fn days(&mut self, year: i64, month: i64, day: i64) -> i64 {
+        let packed = (year << 9) | (month << 5) | day;
+        if packed != self.packed {
+            self.packed = packed;
+            self.days = days_from_civil(year, month, day);
         }
-    })
+        self.days
+    }
 }
 
 /// Epoch ms, or None for a bad timestamp.
 pub fn parse(value: &[u8]) -> Option<i64> {
+    parse_cached(value, &mut DateCache::default())
+}
+
+/// `parse` with a caller-owned date cache.
+#[inline]
+pub fn parse_cached(value: &[u8], dates: &mut DateCache) -> Option<i64> {
     if ascii_digits(value) {
         let mut result: i64 = 0;
         for &byte in value {
@@ -103,7 +113,7 @@ pub fn parse(value: &[u8]) -> Option<i64> {
     if day < 1 || day > month_days || hour > 23 || minute > 59 || second > 59 {
         return None;
     }
-    let local = (days_cached(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second) * 1_000;
+    let local = (dates.days(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second) * 1_000;
     Some(local - offset_ms)
 }
 
