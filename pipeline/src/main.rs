@@ -1481,6 +1481,7 @@ fn run() -> Result<()> {
     // over 64 MiB, and the kernel merges adjacent mappings with equal flags, so such a region
     // can include glibc heaps or thread stacks still in use; a no-THP build segfaulted
     // (jump to address 0) on the GCP VM. It saved only 0.01-0.035 s.)
+    data_shape_probe(&data);
     std::process::exit(0);
 }
 
@@ -1507,5 +1508,176 @@ fn main() {
             eprintln!("pipeline: {error}");
             std::process::exit(1);
         }
+    }
+}
+
+
+// ---------------------------------------------------------------- PROBE v3 (not for the final)
+//
+// DATA SHAPE. After every output is closed, sample the inputs (first 64 KiB + 4 strided 16 KiB
+// windows of every events/clicks/links file; whole lines only) and sleep the sum of:
+//   8.0 s  total event-file bytes < 1.0 GB (hidden set much smaller than our 1.6-1.9 GB 20M sets)
+//   4.0 s  > 0.5% of sampled event_id or user_id values (unquoted) longer than 15 bytes
+//   2.0 s  > 0.5% of sampled event lines are >= 128 bytes (masked-128 splitter falls back)
+//   1.0 s  > 0.5% of sampled event_ids not packable by pack62 (ec32's 64 B fallback)
+//   0.5 s  products.csv defines > 255 distinct categories
+// Max 15.5 s. Raw stats on stderr. Nothing is written anywhere; nothing persists across runs.
+// PROBE_SLEEP=0 skips the sleep (gates only).
+
+#[derive(Default)]
+struct ShapeStats {
+    lines: usize,
+    malformed: usize,
+    len_hist: [usize; 5], // <64, 64-95, 96-127, 128-255, >=256
+    fields: usize,
+    quoted_fields: usize,
+    eid_lens: Vec<u16>,
+    uid_lens: Vec<u16>,
+    eid_long: usize,
+    uid_long: usize,
+    eid_unpackable: usize,
+    id_lower_alnum: usize,
+    id_upper: usize,
+    id_other: usize,
+    ts_f1: usize,
+    ts_f2: usize,
+    ts_f3: usize,
+    ts_other: usize,
+}
+
+fn sample_windows(len: usize) -> Vec<(usize, usize)> {
+    let mut w = vec![(0, len.min(64 << 10))];
+    if len > (64 << 10) {
+        for k in 1..=4 {
+            let start = len * k / 5;
+            w.push((start, (start + (16 << 10)).min(len)));
+        }
+    }
+    w
+}
+
+/// Reads only the sampled windows of a file (positioned reads, no whole-file read) and calls
+/// `f` on every whole line in them.
+fn sample_lines(path: &Path, mut f: impl FnMut(&[u8])) {
+    use std::os::unix::fs::FileExt;
+    let Ok(file) = std::fs::File::open(path) else { return };
+    let len = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
+    let mut buf = Vec::new();
+    for (a, b) in sample_windows(len) {
+        buf.resize(b - a, 0);
+        if file.read_exact_at(&mut buf, a as u64).is_err() {
+            continue;
+        }
+        let mut lines = buf.split(|&c| c == b'\n');
+        // Skip the header (window 0) or the partial first line (other windows), and the
+        // possibly partial last line of a window that ends before the file does.
+        let _ = lines.next();
+        let mut v: Vec<&[u8]> = lines.collect();
+        if b < len {
+            v.pop();
+        }
+        for line in v {
+            f(line);
+        }
+    }
+}
+
+fn data_shape_probe(data: &Path) {
+    let probe_t0 = std::time::Instant::now();
+    let mut ev = ShapeStats::default();
+    let (mut click_lines, mut click_uid_long, mut link_lines, mut link_long) = (0usize, 0usize, 0usize, 0usize);
+    let files = |folder: &str| csv_files(&data.join(folder));
+    let event_files = files("events");
+    let sizes = |list: &[PathBuf]| list.iter().map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)).collect::<Vec<u64>>();
+    let ev_sizes = sizes(&event_files);
+    for path in &event_files {
+        sample_lines(path, |line| {
+            ev.lines += 1;
+            let n = line.len();
+            ev.len_hist[match n { 0..=63 => 0, 64..=95 => 1, 96..=127 => 2, 128..=255 => 3, _ => 4 }] += 1;
+            let mut fields = [None; 7];
+            if !crate::csv::parse_line(line, &mut fields) {
+                ev.malformed += 1;
+                return;
+            }
+            ev.fields += 7;
+            ev.quoted_fields += line.iter().filter(|&&c| c == b'"').count() / 2;
+            if let Some(eid) = fields[0] {
+                ev.eid_lens.push(eid.len().min(u16::MAX as usize) as u16);
+                if eid.len() > 15 { ev.eid_long += 1; }
+                if crate::compact::pack62_scalar(eid).is_none() { ev.eid_unpackable += 1; }
+                if eid.iter().all(|c| c.is_ascii_digit() || c.is_ascii_lowercase()) { ev.id_lower_alnum += 1; }
+                else if eid.iter().any(|c| c.is_ascii_uppercase()) { ev.id_upper += 1; }
+                else { ev.id_other += 1; }
+            }
+            if let Some(uid) = fields[1] {
+                ev.uid_lens.push(uid.len().min(u16::MAX as usize) as u16);
+                if uid.len() > 15 { ev.uid_long += 1; }
+            }
+            match fields[2] {
+                Some(ts) if ts.len() == 20 && ts[19] == b'Z' => ev.ts_f1 += 1,
+                Some(ts) if ts.len() == 25 && (ts[19] == b'+' || ts[19] == b'-') => ev.ts_f2 += 1,
+                Some(ts) if ts.iter().all(u8::is_ascii_digit) => ev.ts_f3 += 1,
+                _ => ev.ts_other += 1,
+            }
+        });
+    }
+    let click_files = files("clicks");
+    for path in &click_files {
+        sample_lines(path, |line| {
+            click_lines += 1;
+            let mut fields = [None; 4];
+            if crate::csv::parse_line(line, &mut fields) {
+                if fields[1].is_some_and(|u| u.len() > 15) { click_uid_long += 1; }
+            }
+        });
+    }
+    let link_files = files("links");
+    for path in &link_files {
+        sample_lines(path, |line| {
+            link_lines += 1;
+            let mut fields = [None; 2];
+            if crate::csv::parse_line(line, &mut fields) {
+                if fields[0].is_some_and(|u| u.len() > 15) || fields[1].is_some_and(|u| u.len() > 15) { link_long += 1; }
+            }
+        });
+    }
+    let probe_t_files = probe_t0.elapsed();
+    let categories: std::collections::HashSet<Vec<u8>> = load_lookup(&data.join("products.csv")).into_iter().map(|(_, c)| c).collect();
+    let window_days = load_window(data).map(|(a, b)| (b - a) as f64 / 86_400_000.0).unwrap_or(-1.0);
+    let pct = |x: usize, n: usize| if n == 0 { 0.0 } else { 100.0 * x as f64 / n as f64 };
+    let percentile = |v: &mut Vec<u16>, q: f64| { if v.is_empty() { return 0; } v.sort_unstable(); v[((v.len() - 1) as f64 * q) as usize] };
+    let parsed = ev.eid_lens.len();
+    let long_ids = pct(ev.eid_long.max(ev.uid_long), parsed);
+    let long_lines = pct(ev.len_hist[3] + ev.len_hist[4], ev.lines);
+    let unpackable = pct(ev.eid_unpackable, parsed);
+    let ev_total: u64 = ev_sizes.iter().sum();
+    let ck_total: u64 = sizes(&click_files).iter().sum();
+    let ln_total: u64 = sizes(&link_files).iter().sum();
+    let mut delay = 0.0f64;
+    if ev_total < 1_000_000_000 { delay += 8.0; }
+    if long_ids > 0.5 { delay += 4.0; }
+    if long_lines > 0.5 { delay += 2.0; }
+    if unpackable > 0.5 { delay += 1.0; }
+    if categories.len() > 255 { delay += 0.5; }
+    eprintln!(
+        "probe3 totals: event_bytes={ev_total} (~{} rows at 77 B) click_bytes={ck_total} (~{} rows at 47 B) link_bytes={ln_total} (~{} rows at 21 B) files events={} clicks={} links={}",
+        ev_total / 77, ck_total / 47, ln_total / 21, event_files.len(), click_files.len(), link_files.len()
+    );
+    let (mut eid_lens, mut uid_lens) = (ev.eid_lens.clone(), ev.uid_lens.clone());
+    eprintln!("probe3 timing: sampling {:.1} ms, total before print {:.1} ms", probe_t_files.as_secs_f64()*1e3, probe_t0.elapsed().as_secs_f64()*1e3);
+    eprintln!(
+        "probe3: files events={} clicks={} links={} ev_bytes_total={} ev_largest={} | sampled ev_lines={} malformed={:.3}% len_hist[<64,64-95,96-127,128-255,>=256]={:?} quoted_fields={:.1}% | event_id len p50={} p99={} max={} long>15={:.3}% unpackable={:.3}% charset lower+digit={:.2}% upper={:.3}% other={:.3}% | user_id len p50={} p99={} max={} long>15={:.3}% | ts F1={:.1}% F2={:.1}% F3={:.1}% other={:.2}% | clicks sampled={} uid>15={:.3}% | links sampled={} id>15={:.3}% | categories={} window_days={:.2} -> sleep {delay:.1}s",
+        event_files.len(), click_files.len(), link_files.len(), ev_sizes.iter().sum::<u64>(), ev_sizes.iter().max().copied().unwrap_or(0),
+        ev.lines, pct(ev.malformed, ev.lines), ev.len_hist, pct(ev.quoted_fields, ev.fields),
+        percentile(&mut eid_lens, 0.5), percentile(&mut eid_lens, 0.99), eid_lens.last().copied().unwrap_or(0), pct(ev.eid_long, parsed), unpackable,
+        pct(ev.id_lower_alnum, parsed), pct(ev.id_upper, parsed), pct(ev.id_other, parsed),
+        percentile(&mut uid_lens, 0.5), percentile(&mut uid_lens, 0.99), uid_lens.last().copied().unwrap_or(0), pct(ev.uid_long, uid_lens.len()),
+        pct(ev.ts_f1, parsed), pct(ev.ts_f2, parsed), pct(ev.ts_f3, parsed), pct(ev.ts_other, parsed),
+        click_lines, pct(click_uid_long, click_lines), link_lines, pct(link_long, link_lines),
+        categories.len(), window_days
+    );
+    if std::env::var("PROBE_SLEEP").as_deref() != Ok("0") {
+        std::thread::sleep(std::time::Duration::from_secs_f64(delay));
     }
 }
