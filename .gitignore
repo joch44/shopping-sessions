@@ -7,3 +7,4 @@ tests/corpus/cases/
 tests/fuzz-failures/
 tools/floor/target/
 tools/generator/target/
+__pycache__/
