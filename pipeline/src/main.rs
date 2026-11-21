@@ -76,6 +76,7 @@ fn person_partitions() -> usize {
     PERSON_PARTITIONS.load(Ordering::Relaxed)
 }
 const CHUNK_BYTES: usize = 16 << 20;
+const CLICK_CHUNK_BYTES: usize = 4 << 20;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -186,7 +187,11 @@ fn chunk_bytes() -> usize {
 }
 
 fn chunks_of(kind: Kind, maps: &[Option<Mmap>], out: &mut Vec<Chunk>) {
-    let chunk_bytes = chunk_bytes();
+    // Clicks are ~12% of the input in their own pool: smaller chunks balance its tail.
+    let chunk_bytes = match kind {
+        Kind::Click if std::env::var_os("PIPELINE_CHUNK_BYTES").is_none() => CLICK_CHUNK_BYTES,
+        _ => chunk_bytes(),
+    };
     for (file, map) in maps.iter().enumerate() {
         let len = bytes_of(map).len();
         let mut start = 0;
@@ -214,6 +219,34 @@ fn load_lookup(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
         }
     }
     rows
+}
+
+/// products.csv: product key -> category index (first occurrence of a product wins, as in
+/// `load_lookup`), plus the category names in index order. It borrows from the file bytes
+/// and allocates only for new category names: the generic loader's ~4 allocations per row
+/// made this the whole of startup (17 ms of 17 at 20M; the other lookups and mmaps < 2 ms).
+fn load_products(path: &Path) -> (FxHashMap<Key, u32>, Vec<Vec<u8>>) {
+    let Ok(bytes) = std::fs::read(path) else { return (FxHashMap::default(), Vec::new()) };
+    let mut products: FxHashMap<Key, u32> = FxHashMap::default();
+    products.reserve(bytes.len() / 16);
+    let mut category_names: Vec<Vec<u8>> = Vec::new();
+    let mut category_index: FxHashMap<&[u8], u32> = FxHashMap::default();
+    let mut fields = [None; 2];
+    for line in data_lines(&bytes) {
+        if !parse_line(line, &mut fields) {
+            continue;
+        }
+        let Some(product) = fields[0] else { continue };
+        let std::collections::hash_map::Entry::Vacant(slot) = products.entry(key_of(product, None)) else { continue };
+        let category = fields[1].unwrap_or_default();
+        let next = category_names.len() as u32;
+        let index = *category_index.entry(category).or_insert(next);
+        if index == next {
+            category_names.push(category.to_vec());
+        }
+        slot.insert(index);
+    }
+    (products, category_names)
 }
 
 fn load_window(data: &Path) -> Result<(i64, i64)> {
@@ -574,7 +607,7 @@ fn parse_chunk(
     }
 }
 
-const CLICK_BATCH: usize = 32;
+const CLICK_BATCH: usize = 64; // research sweep: 16/32/64/128 -> 0.125/0.118/0.116/0.116 s (mirror, 20M)
 
 /// Resolves a batch of clicks' persons (prefetched when they entered the batch) and
 /// scatters them by person.
@@ -980,27 +1013,37 @@ fn run() -> Result<()> {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from));
 
     // A. lookups
-    let window = load_window(&data)?;
-    let mut category_names: Vec<Vec<u8>> = Vec::new();
-    let mut category_index: FxHashMap<Vec<u8>, u32> = FxHashMap::default();
-    let mut products = FxHashMap::default();
-    for (product, category) in load_lookup(&data.join("products.csv")) {
-        let next = category_names.len() as u32;
-        let index = *category_index.entry(category.clone()).or_insert(next);
-        if index == next {
-            category_names.push(category);
-        }
-        products.insert(key_of(&product, None), index);
-    }
+    // The lookups and the three folders' mmaps are independent: one thread each, so
+    // startup is the slowest of them rather than their sum.
+    let data_ref = &data;
+    let (window, (products, category_names), (campaign_rows, campaigns), event_maps, click_maps, link_maps) =
+        std::thread::scope(|scope| -> Result<_> {
+            let products = scope.spawn(move || load_products(&data_ref.join("products.csv")));
+            let campaigns = scope.spawn(move || {
+                let campaign_rows = load_lookup(&data_ref.join("campaigns.csv"));
+                let campaigns: FxHashMap<Key, u32> =
+                    campaign_rows.iter().enumerate().map(|(index, (id, _))| (key_of(id, None), index as u32)).collect();
+                (campaign_rows, campaigns)
+            });
+            let map = |folder: &'static str| scope.spawn(move || map_folder(&data_ref.join(folder)).map_err(|e| e.to_string()));
+            let (events, clicks, links) = (map("events"), map("clicks"), map("links"));
+            let window = load_window(data_ref)?;
+            let join_maps = |h: std::thread::ScopedJoinHandle<'_, std::result::Result<Vec<Option<Mmap>>, String>>| -> Result<Vec<Option<Mmap>>> {
+                Ok(h.join().expect("mmap thread panicked")?)
+            };
+            Ok((
+                window,
+                products.join().expect("products thread panicked"),
+                campaigns.join().expect("campaigns thread panicked"),
+                join_maps(events)?,
+                join_maps(clicks)?,
+                join_maps(links)?,
+            ))
+        })?;
+    let mut category_names = category_names;
     // `unknown`: a name no category in the file uses (rules.md), so a fresh index.
     let unknown_category = category_names.len() as u32;
     category_names.push(b"unknown".to_vec());
-    let campaign_rows = load_lookup(&data.join("campaigns.csv"));
-    let campaigns: FxHashMap<Key, u32> =
-        campaign_rows.iter().enumerate().map(|(index, (id, _))| (key_of(id, None), index as u32)).collect();
-    let event_maps = map_folder(&data.join("events"))?;
-    let click_maps = map_folder(&data.join("clicks"))?;
-    let link_maps = map_folder(&data.join("links"))?;
     timer.mark("lookups + mmap");
 
     let context = Context { window, products, unknown_category, campaigns, longs: LongIds::default() };
@@ -1091,10 +1134,12 @@ fn run() -> Result<()> {
 
     // E. output.
     output::prepare(&out)?;
-    let mut campaign_daily: FxHashMap<(u32, i32), CampaignCounts> = FxHashMap::default();
+    // The per-thread campaign counters are merged on the campaign_daily writer's thread,
+    // in parallel with the user_daily writers, instead of serially before them.
+    let mut counters = Vec::with_capacity(states.len());
     let mut user_parts = Vec::new();
     for state in states {
-        state.campaign_daily.merge_into(&mut campaign_daily);
+        counters.push(state.campaign_daily);
         if !state.user_rows.is_empty() {
             user_parts.push(state.user_rows);
         }
@@ -1112,11 +1157,14 @@ fn run() -> Result<()> {
             });
         }
         let (out, failures) = (&out, &failures);
-        let campaign_daily = &campaign_daily;
         let campaign_rows = &campaign_rows;
         scope.spawn(move || {
+            let mut campaign_daily: FxHashMap<(u32, i32), CampaignCounts> = FxHashMap::default();
+            for counter in counters {
+                counter.merge_into(&mut campaign_daily);
+            }
             let path = out.join("campaign_daily/part-00000.parquet");
-            if let Err(error) = output::write_campaign_daily_fast(&path, campaign_daily, campaign_rows) {
+            if let Err(error) = output::write_campaign_daily_fast(&path, &campaign_daily, campaign_rows) {
                 failures.lock().unwrap().push(error.to_string());
             }
         });
