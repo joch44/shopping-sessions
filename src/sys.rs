@@ -99,6 +99,10 @@ struct ExecInfo {
     data: String,
     out: String,
     ncpu: usize,
+    // argv for the general pipeline at /fallback, built up front so the fault-signal
+    // handler can exec it without allocating.
+    _fb_args: Vec<CString>,
+    fb_ptrs: Vec<*const c_char>,
 }
 static mut EXEC: Option<ExecInfo> = None;
 
@@ -112,8 +116,11 @@ pub fn exec_init(args: &[String], data: &str, out: &str, ncpu: usize) {
     }
     let mut ptrs: Vec<*const c_char> = a.iter().map(|c| c.as_ptr()).collect();
     ptrs.push(std::ptr::null());
+    let fb = vec![cs("/fallback"), cs(data), cs(out)];
+    let mut fb_ptrs: Vec<*const c_char> = fb.iter().map(|c| c.as_ptr()).collect();
+    fb_ptrs.push(std::ptr::null());
     unsafe {
-        EXEC = Some(ExecInfo { argv0, _args: a, ptrs, data: data.to_string(), out: out.to_string(), ncpu });
+        EXEC = Some(ExecInfo { argv0, _args: a, ptrs, data: data.to_string(), out: out.to_string(), ncpu, _fb_args: fb, fb_ptrs });
     }
 }
 
@@ -127,10 +134,7 @@ pub fn fallback(why: &str) -> ! {
             // Hand the whole job to the general pipeline shipped at /fallback (our own
             // implementation; it reads the same DATA_DIR / OUTPUT_DIR). Only if it is
             // missing do we re-exec this binary in its own generic mode.
-            if let (Ok(d), Ok(o)) = (CString::new(e.data.as_str()), CString::new(e.out.as_str())) {
-                let argv = [c"/fallback".as_ptr(), d.as_ptr(), o.as_ptr(), std::ptr::null()];
-                execve(c"/fallback".as_ptr(), argv.as_ptr(), environ);
-            }
+            execve(c"/fallback".as_ptr(), e.fb_ptrs.as_ptr(), environ);
             execve(c"/proc/self/exe".as_ptr(), e.ptrs.as_ptr(), environ);
             execve(e.argv0.as_ptr(), e.ptrs.as_ptr(), environ);
             eprintln!("[v2b] exec failed");
@@ -151,6 +155,7 @@ extern "C" fn on_fault(_sig: i32) {
         write(2, msg.as_ptr() as *const core::ffi::c_void, msg.len());
         #[allow(static_mut_refs)]
         if let Some(e) = EXEC.as_ref() {
+            execve(c"/fallback".as_ptr(), e.fb_ptrs.as_ptr(), environ);
             execve(c"/proc/self/exe".as_ptr(), e.ptrs.as_ptr(), environ);
             execve(e.argv0.as_ptr(), e.ptrs.as_ptr(), environ);
         }
