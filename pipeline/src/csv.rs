@@ -87,6 +87,98 @@ pub fn for_each_record<'a, const N: usize>(
     }
 }
 
+/// Like `for_each_record`, but rows reach `fast` as fixed-shape offsets instead of an
+/// `Option` array: `fast(line, bounds, offset)` with `bounds[i] = (a, e)` the UNQUOTED value
+/// range of field i within `line` (`a == e` means null). Every well-formed line shorter
+/// than 128 bytes takes `fast` (with AVX-512BW + BMI2); longer lines, and every line on
+/// other CPUs, take `slow(fields, offset)` exactly like `for_each_record`. Malformed lines
+/// reach neither. The two closures together see exactly the lines `for_each_record` sees,
+/// with the same values.
+#[inline]
+#[allow(dead_code)] // used by the research session's upcoming judge patch
+pub fn for_each_record_offsets<'a, const N: usize>(
+    data: &'a [u8],
+    start: usize,
+    end: usize,
+    #[allow(unused_mut, unused_variables)] mut fast: impl FnMut(&'a [u8], &[(u8, u8); N], usize),
+    mut slow: impl FnMut(&[Option<&'a [u8]>; N], usize),
+) {
+    let first = if start == 0 { memchr::memchr(b'\n', data) } else { memchr::memchr(b'\n', &data[start - 1..]).map(|i| i + start - 1) };
+    let Some(newline) = first else { return };
+    let mut pos = newline + 1;
+    let mut fields: [Option<&'a [u8]>; N] = [None; N];
+    #[allow(unused_mut, unused_variables)]
+    let mut bounds = [(0u8, 0u8); N];
+    while pos < end && pos < data.len() {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "bmi2"))]
+        {
+            let remaining = data.len() - pos;
+            // SAFETY: masked loads read only bytes in pos..data.len(); avx512bw is enabled.
+            let (newlines, commas, quotes) = unsafe { masks128(data.as_ptr().add(pos), remaining) };
+            if newlines != 0 || remaining < 128 {
+                let n = if newlines != 0 { newlines.trailing_zeros() as usize } else { remaining };
+                let line_start = pos;
+                pos += n + 1;
+                if n > 0 && split_offsets(n, commas, quotes, &mut bounds) {
+                    fast(&data[line_start..line_start + n], &bounds, line_start);
+                }
+                continue;
+            }
+        }
+        let line_end = memchr::memchr(b'\n', &data[pos..]).map_or(data.len(), |i| pos + i);
+        if parse_line(&data[pos..line_end], &mut fields) {
+            slow(&fields, pos);
+        }
+        pos = line_end + 1;
+    }
+}
+
+/// `split_masked`'s rule, writing unquoted (start, end) offsets instead of slices.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "bmi2"))]
+#[inline(always)]
+#[allow(dead_code)]
+fn split_offsets<const N: usize>(n: usize, commas: u128, quotes: u128, out: &mut [(u8, u8); N]) -> bool {
+    use std::arch::x86_64::_pext_u64;
+    #[inline(always)]
+    fn pext128(x: u128, m: u128) -> u32 {
+        // SAFETY: bmi2 is enabled (cfg above).
+        unsafe {
+            let lo = _pext_u64(x as u64, m as u64);
+            let hi = _pext_u64((x >> 64) as u64, (m >> 64) as u64);
+            (lo | hi << (m as u64).count_ones()) as u32
+        }
+    }
+    let in_line = (1u128 << n) - 1;
+    let mut commas = commas & in_line;
+    if commas.count_ones() as usize != N - 1 {
+        return false;
+    }
+    let quotes = quotes & in_line;
+    let fs = commas << 1 | 1;
+    let fe = commas | 1u128 << n;
+    let sq = quotes & fs;
+    let eq = (quotes << 1) & fe;
+    let start_q = pext128(sq, fs);
+    let end_q = pext128(eq, fe);
+    let ok = (start_q == end_q) & ((sq & (eq >> 1)) == 0) & (quotes.count_ones() == sq.count_ones() + eq.count_ones());
+    let mut field_start = 0usize;
+    for (i, slot) in out.iter_mut().enumerate() {
+        let field_end = if i + 1 < N {
+            let at = commas.trailing_zeros() as usize;
+            commas &= commas - 1;
+            at
+        } else {
+            n
+        };
+        let f = ((start_q >> i) & 1) as usize;
+        let a = field_start + f;
+        let b = (field_end - f).max(a);
+        *slot = (a as u8, b as u8);
+        field_start = field_end + 1;
+    }
+    ok
+}
+
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
 #[inline(always)]
 unsafe fn masks128(p: *const u8, remaining: usize) -> (u128, u128, u128) {
@@ -105,8 +197,64 @@ unsafe fn masks128(p: *const u8, remaining: usize) -> (u128, u128, u128) {
 }
 
 /// Fields of one line (n = line.len() < 128 bytes, no `\n`) from its comma and quote masks;
-/// the same rules as `parse_line`.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+/// the same accept/reject and values as `parse_line`.
+///
+/// The quote rule is decided once per line in registers (no per-field branch). For field i
+/// (start s_i, end e_i = its comma or n), the start markers FS = commas << 1 | 1 and the end
+/// markers FE = commas | 1 << n hold exactly one bit per field, empty fields included.
+/// Quotes at a start are SQ = quotes & FS; quotes at a field's last byte show up as
+/// EQ = (quotes << 1) & FE. PEXT turns both into per-field bit vectors, which must be equal
+/// (a field starts with a quote iff it ends with one). A 1-byte field `"` (its quote in both
+/// SQ and EQ) is rejected outright, so no quote is counted twice; then every quote must be
+/// one of those: popcount(quotes) == |SQ| + |EQ| rejects any other quote in the line.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "bmi2"))]
+#[inline(always)]
+fn split_masked<'a, const N: usize>(line: &'a [u8], commas: u128, quotes: u128, out: &mut [Option<&'a [u8]>; N]) -> bool {
+    use std::arch::x86_64::_pext_u64;
+    #[inline(always)]
+    fn pext128(x: u128, m: u128) -> u32 {
+        // SAFETY: bmi2 is enabled (cfg above).
+        unsafe {
+            let lo = _pext_u64(x as u64, m as u64);
+            let hi = _pext_u64((x >> 64) as u64, (m >> 64) as u64);
+            (lo | hi << (m as u64).count_ones()) as u32
+        }
+    }
+    let n = line.len();
+    let in_line = (1u128 << n) - 1;
+    let mut commas = commas & in_line;
+    if commas.count_ones() as usize != N - 1 {
+        return false;
+    }
+    let quotes = quotes & in_line;
+    let fs = commas << 1 | 1;
+    let fe = commas | 1u128 << n;
+    let sq = quotes & fs;
+    let eq = (quotes << 1) & fe;
+    let start_q = pext128(sq, fs);
+    let end_q = pext128(eq, fe);
+    let ok = (start_q == end_q) & ((sq & (eq >> 1)) == 0) & (quotes.count_ones() == sq.count_ones() + eq.count_ones());
+    let mut field_start = 0usize;
+    for (i, slot) in out.iter_mut().enumerate() {
+        let field_end = if i + 1 < N {
+            let at = commas.trailing_zeros() as usize;
+            commas &= commas - 1;
+            at
+        } else {
+            n
+        };
+        let f = ((start_q >> i) & 1) as usize;
+        let a = field_start + f;
+        let b = (field_end - f).max(a);
+        // SAFETY: field_start <= a <= b <= field_end <= n.
+        *slot = if a == b { None } else { Some(unsafe { line.get_unchecked(a..b) }) };
+        field_start = field_end + 1;
+    }
+    ok
+}
+
+/// Without BMI2 (never the case for cascadelake builds): v11's per-field quote check.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", not(target_feature = "bmi2")))]
 #[inline(always)]
 fn split_masked<'a, const N: usize>(line: &'a [u8], commas: u128, quotes: u128, out: &mut [Option<&'a [u8]>; N]) -> bool {
     let n = line.len();
@@ -130,7 +278,6 @@ fn split_masked<'a, const N: usize>(line: &'a [u8], commas: u128, quotes: u128, 
             let in_field = ((1u128 << field_end) - 1) & !((1u128 << field_start) - 1);
             let q = quotes & in_field;
             if q != 0 {
-                // Quotes are allowed only as the first and last byte of the whole field.
                 if b - a < 2 || q != (1u128 << a | 1u128 << (b - 1)) {
                     return false;
                 }
