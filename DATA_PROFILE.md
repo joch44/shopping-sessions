@@ -43,11 +43,13 @@ regularity below needs a check and a general fallback.**
 | largest person's share of events | 1.3-2.0% | 1.8-2.0% |
 | IDs in the largest linked person | 196-382 | **1,232-1,665** |
 
-- The largest people are the **kiosk merges** (thousands of generated users joined by a
-  shared device), scaling with data size: ~385k events in one person at 20M, so roughly
-  1.1M+ at 60M. Their sessions merge heavily (only ~240-290 sessions despite 385k events).
-  Per-person work must not stall one thread on them: sorting ~1M events of one person is
-  ~0.05-0.1 s single-threaded; acceptable, but schedule the heavy people first.
+- The heaviest people are the generator's **5 whales** (1-2% of all events each, 3-6 IDs,
+  a session in all 168 two-hour slots): ~385k events at 20M, so ~1M+ at 60M. *(Corrected
+  2026-11-21: an earlier version said kiosk merges; a kiosk group joins ~600 generated users
+  but holds only ~0.1% of events. Kiosks are the largest link components (1.2k-1.7k IDs),
+  not the heaviest people.)* Sorting ~1M events of one person is ~0.05-0.1 s on one thread:
+  schedule partitions largest-first from exact counts after the scatter; don't predict
+  weight from link-component size.
 - Typical person: a dozen events, 3 sessions. Small-person fast path (insertion sort) matters.
 
 ## Output
