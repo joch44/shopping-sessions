@@ -758,13 +758,13 @@ unsafe fn and_m(v: __m128i, m: *const u8) -> __m128i {
 #[inline(always)]
 fn jid_off(c0: u64, c1: u64) -> u64 {
     let o: u64;
-    unsafe { core::arch::asm!("imul {o}, {a}, 63", "add {o}, {b}", "shl {o}, 7", o = lateout(reg) o, a = in(reg) c0, b = in(reg) c1, options(pure, nomem, nostack)) };
+    unsafe { core::arch::asm!("imul {o}, {a}, 63", "add {o}, {b}", "shl {o}, 7", o = out(reg) o, a = in(reg) c0, b = in(reg) c1, options(pure, nomem, nostack)) };
     o
 }
 #[inline(always)]
 fn add_sub<const D: i32>(a: u64, b: u64) -> u64 {
     let o: u64;
-    unsafe { core::arch::asm!("lea {o}, [{a} + {d}]", "sub {o}, {b}", o = lateout(reg) o, a = in(reg) a, b = in(reg) b, d = const D, options(pure, nomem, nostack)) };
+    unsafe { core::arch::asm!("lea {o}, [{a} + {d}]", "sub {o}, {b}", o = out(reg) o, a = in(reg) a, b = in(reg) b, d = const D, options(pure, nomem, nostack)) };
     o
 }
 #[inline(always)]
