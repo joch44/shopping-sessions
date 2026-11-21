@@ -68,7 +68,7 @@ Mirror VM: 3.01 s @20M, 8.81 s @60M. All outputs match.
 | v28 | scouter: products loader, parallel startup, counter merge on writer thread, 4 MiB click chunks, CLICK_BATCH 64 | | | |
 | v29 | research: incremental assists window | 1.30 | 3.26 | interleaved vs v26: 1.348 / 3.596 (-0.34 s at 60M) |
 | v30 | research ts32 sessions (u32 offsets, i64 fallback for long windows added here) + plain click keys | 1.27 | 3.29 | interleaved vs v29: 1.303 / 3.321 |
-| v31 | research one-pass grouping in sessions | PENDING | | research: sessions 0.201 -> 0.192 / 0.579 -> 0.540 |
+| v31 | research one-pass grouping in sessions | 1.27 | 3.28 | interleaved vs v30: 1.283 / 3.336; sessions 0.17 s @20M, 0.48 s @60M |
 
 Calibration: v9 mirror 2.24 s vs grader 1.97 s -> factor 0.878 (tools/to_board.py). Target <1.0 s grader
 ~= 1.1 s mirror. Container start/stop floor ~0.34 s (research): in-process budget ~0.75 s @20M.
