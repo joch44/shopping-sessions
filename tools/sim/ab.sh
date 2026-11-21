@@ -8,6 +8,8 @@ set -uo pipefail
 exec 9>/srv/nolimit/run.lock; flock 9; exec 8>>/tmp/feas-bench.lock; flock 8
 export HOLDING_LOCKS=1
 A=$1; B=$2; DS=$3; N=${4:-5}; ta=(); tb=()
+# Warm the page cache first (other sessions' datasets may have evicted this one).
+cat /srv/nolimit/datasets/$DS/events/* /srv/nolimit/datasets/$DS/clicks/* /srv/nolimit/datasets/$DS/links/* > /dev/null
 for i in $(seq 1 "$N"); do
   for t in "$A" "$B"; do
     w=$(DATA=/srv/nolimit/datasets/$DS RUNS=1 NOBUILD=1 nolimit-run - "shopping-rust:$t" 2>/dev/null | grep -oE 'wall_s=[0-9.]+' | cut -d= -f2)
