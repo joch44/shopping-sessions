@@ -24,27 +24,30 @@ pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + day_of_era - 719_468
 }
 
-/// The last date converted: a window holds few dates.
+/// Days since the epoch of each month's first day, in 16 direct-mapped slots keyed by
+/// year*12+month: a window spans a few months, but rows are shuffled across its days,
+/// so caching by month (not by date) hits nearly always.
 pub struct DateCache {
-    packed: i64,
-    days: i64,
+    months: [i64; 16],
+    first_days: [i64; 16],
 }
 
 impl Default for DateCache {
     fn default() -> Self {
-        Self { packed: i64::MIN, days: 0 }
+        Self { months: [i64::MIN; 16], first_days: [0; 16] }
     }
 }
 
 impl DateCache {
-    #[inline]
+    #[inline(always)]
     fn days(&mut self, year: i64, month: i64, day: i64) -> i64 {
-        let packed = (year << 9) | (month << 5) | day;
-        if packed != self.packed {
-            self.packed = packed;
-            self.days = days_from_civil(year, month, day);
+        let key = year * 12 + month - 1;
+        let slot = (key & 15) as usize;
+        if self.months[slot] != key {
+            self.months[slot] = key;
+            self.first_days[slot] = days_from_civil(year, month, 1);
         }
-        self.days
+        self.first_days[slot] + day - 1
     }
 }
 
@@ -112,8 +115,12 @@ pub fn parse_cached(value: &[u8], dates: &mut DateCache) -> Option<i64> {
     if value[4] != b'-' || value[7] != b'-' || value[10] != b'T' || value[13] != b':' || value[16] != b':' {
         return None;
     }
-    const DIGITS: [usize; 14] = [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18];
-    if DIGITS.iter().any(|&i| digit(i) >= 10) {
+    // All 14 date/time digits checked at once, branch-free.
+    let all_digits = (digit(0) < 10) & (digit(1) < 10) & (digit(2) < 10) & (digit(3) < 10)
+        & (digit(5) < 10) & (digit(6) < 10) & (digit(8) < 10) & (digit(9) < 10)
+        & (digit(11) < 10) & (digit(12) < 10) & (digit(14) < 10) & (digit(15) < 10)
+        & (digit(17) < 10) & (digit(18) < 10);
+    if !all_digits {
         return None;
     }
     let two = |i: usize| i64::from(digit(i) * 10 + digit(i + 1));
