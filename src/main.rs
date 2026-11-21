@@ -2,6 +2,7 @@
 mod ckix;
 mod complex;
 mod core;
+mod cpuguard;
 mod events;
 mod iface;
 mod k_ref;

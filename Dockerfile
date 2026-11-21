@@ -20,8 +20,19 @@ RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \
  && cp target/x86_64-unknown-linux-gnu/release/pipeline /fallback \
  && chmod 0755 /fallback
 
+# Stage 3: the same general pipeline for hosts without AVX-512 (src/cpuguard.rs picks one
+# before any AVX-512 code runs): x86-64-v3 (AVX2) and x86-64-v2.
+FROM fallback AS portable
+RUN RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static" cargo build --release --locked --target x86_64-unknown-linux-gnu --target-dir /t3 \
+ && cp /t3/x86_64-unknown-linux-gnu/release/pipeline /fallback-v3 \
+ && RUSTFLAGS="-C target-cpu=x86-64-v2 -C target-feature=+crt-static" cargo build --release --locked --target x86_64-unknown-linux-gnu --target-dir /t2 \
+ && cp /t2/x86_64-unknown-linux-gnu/release/pipeline /fallback-v2 \
+ && chmod 0755 /fallback-v3 /fallback-v2
+
 FROM scratch
 COPY --from=build /pipeline /pipeline
 COPY --from=fallback /fallback /fallback
+COPY --from=portable /fallback-v3 /fallback-v3
+COPY --from=portable /fallback-v2 /fallback-v2
 USER 1000:1000
 CMD ["/pipeline"]
