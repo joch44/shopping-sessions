@@ -57,7 +57,8 @@ Mirror VM: 3.01 s @20M, 8.81 s @60M. All outputs match.
 | v17 | click person lookups batched (32) with prefetch | | | clicks 0.18 -> 0.13 s (mirror stage) |
 | v18 | hand-written Parquet writer (research Topic E), crate fallback > 1 GiB | 1.93 | 5.10 | clean interleaved vs v15: 2.00 / 5.41 |
 | v19 | dense campaign counters + 1024 person partitions (research, mirror-measured) | 1.78 | 4.97 | interleaved vs v18: 1.82 / 5.12 |
-| v20 | 16-byte per-person session events, 32-byte clicks | 1.73 | 4.85 | interleaved vs v19: 1.76 / 4.89 |
+| v20 | 16-byte per-person session events, 32-byte clicks | 1.73 | 4.85 | interleaved vs v19: 1.76 / 4.89; **submitted: 1.60 s on the grader** |
+| v21 | non-temporal stores for 64-byte EventCopy (sfence per chunk) | PENDING | | store breakdown (mirror, 20M): split 0.26, judge 0.30, store 0.17, link overlap 0.04; NT: parse events 0.77 -> 0.655 s; research full A/B 1.79 -> 1.66 / 4.83 -> 4.49 |
 
 Calibration: v9 mirror 2.24 s vs grader 1.97 s -> factor 0.878 (tools/to_board.py). Target <1.0 s grader
 ~= 1.1 s mirror. Container start/stop floor ~0.34 s (research): in-process budget ~0.75 s @20M.
@@ -65,6 +66,9 @@ Calibration: v9 mirror 2.24 s vs grader 1.97 s -> factor 0.878 (tools/to_board.p
 Lessons: analysis-VM (Zen 5, 16 cores) gains roughly halve on the mirror (Ice Lake, 4 cores x 2 HT);
 memory-layout changes must be A/B'd on the mirror, interleaved (run-to-run drift is ~2-4%).
 
+Rejected (measured, research, mirror): Click padded to 64 B for NT stores (0.131 -> 0.134 s, worse:
+clicks are not RFO-bound); 32 B Click via source locations (<0.01 s upside); chunk size 16/4/1 MiB
+(<5 ms; no barrier/overlap restructuring worth doing).
 Rejected (measured): v16 one pool for clicks + dedup (no change); 2048/4096 dedup partitions
 (dedup -0.01 s but parse +0.03..0.06 s: more scatter targets); research Topic A one-scatter +
 retractions (correct, slower); radix sort for sessions (research: no gain over counting sort).
