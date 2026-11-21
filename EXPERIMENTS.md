@@ -59,6 +59,7 @@ Mirror VM: 3.01 s @20M, 8.81 s @60M. All outputs match.
 | v19 | dense campaign counters + 1024 person partitions (research, mirror-measured) | 1.78 | 4.97 | interleaved vs v18: 1.82 / 5.12 |
 | v20 | 16-byte per-person session events, 32-byte clicks | 1.73 | 4.85 | interleaved vs v19: 1.76 / 4.89; **submitted: 1.60 s on the grader** |
 | v21 | non-temporal stores for 64-byte EventCopy (sfence per chunk) | 1.67 | 4.46 | store breakdown (mirror, 20M): split 0.26, judge 0.30, store 0.17, link overlap 0.04; NT: parse events 0.77 -> 0.655 s; research full A/B 1.79 -> 1.66 / 4.83 -> 4.49 |
+| v22 | SIMD timestamps (parser session) + ingest_ts fast path (research; relies on the rules' F1 guarantee) | 1.53 | 4.12 | parse events 0.63 -> 0.53 s; research A/B vs v21: 1.65 -> 1.52 / 4.56 -> 4.17 |
 
 Calibration: v9 mirror 2.24 s vs grader 1.97 s -> factor 0.878 (tools/to_board.py). Target <1.0 s grader
 ~= 1.1 s mirror. Container start/stop floor ~0.34 s (research): in-process budget ~0.75 s @20M.
