@@ -906,11 +906,14 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
             sample.events.extend(p.take().events);
         }
         sample.events.truncate(5000);
+        // Stop early when event IDs do not decode: without this, a dataset whose event IDs are
+        // not the generator's scans 600 KB of every event file (~80 ms) before handing off.
+        let mut scanned = 0usize;
         for f in files.iter().filter(|f| f.kind == Kind::Ev).skip(1) {
-            if sample.events.len() >= 5000 {
+            if sample.events.len() >= 5000 || (scanned >= 20_000 && sample.events.len() < 1000) {
                 break;
             }
-            sample.add_event_lines(sample_bytes(unsafe { std::slice::from_raw_parts(region.add(f.off), f.len) }), 5000);
+            scanned += sample.add_event_lines(sample_bytes(unsafe { std::slice::from_raw_parts(region.add(f.off), f.len) }), 5000);
         }
         lap("s.sample");
         let mut st = keyrec::Stats::default();
