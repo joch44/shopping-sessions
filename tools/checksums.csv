@@ -1,0 +1,6 @@
+# Reference-output checksums (tools/compare.py --hash) for timing datasets, by generator params.
+# seed,events,clicks,user_daily,campaign_daily
+11,20000000,5000000,c98987bc8edbe3f6,748480a2f362f338
+12,20000000,5000000,28131d386900e667,57290872e60ec189
+13,20000000,5000000,49244fdea6ca92ed,bb6a22832dea19c6
+301,60000000,15000000,d286670ad17f6b8c,e0acfcf614324002
