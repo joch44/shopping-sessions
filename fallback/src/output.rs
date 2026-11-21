@@ -130,12 +130,12 @@ pub fn write_user_daily_fast(
         "user_daily",
         &["user_id", "day", "sessions", "events", "revenue_cents", "top_category"],
         &[
-            Col::Str { bytes: &names, ends: &name_ends },
-            Col::Date(&days),
-            Col::I64(&sessions),
-            Col::I64(&events),
-            Col::I64(&revenue),
-            Col::OptStr { bytes: &tops, ends: &top_ends, present: &present },
+            Col::StrDict { bytes: &names, ends: &name_ends },
+            Col::DateDict(&days),
+            Col::I64Dict(&sessions),
+            Col::I64Dict(&events),
+            Col::I64Dict(&revenue),
+            Col::OptStrDict { bytes: &tops, ends: &top_ends, present: &present },
         ],
         rows.len(),
     )?;

@@ -16,6 +16,98 @@ pub enum Col<'a> {
     OptStr { bytes: &'a [u8], ends: &'a [u32], present: &'a [bool] },
     Date(&'a [i32]),
     I64(&'a [i64]),
+    /// The same columns, dictionary-encoded (RLE_DICTIONARY: a PLAIN dictionary page, then
+    /// bit-packed indices). Smaller files: the scorer's container returns only after its
+    /// output data is written back, so bytes written cost wall time.
+    StrDict { bytes: &'a [u8], ends: &'a [u32] },
+    OptStrDict { bytes: &'a [u8], ends: &'a [u32], present: &'a [bool] },
+    DateDict(&'a [i32]),
+    I64Dict(&'a [i64]),
+}
+
+/// Dictionary of one column: PLAIN-encoded distinct values and one index per value.
+struct Dict {
+    plain: Vec<u8>,
+    count: usize,
+    indices: Vec<u32>,
+}
+
+fn dict_strings(bytes: &[u8], ends: &[u32]) -> Dict {
+    let mut map: rustc_hash::FxHashMap<&[u8], u32> = rustc_hash::FxHashMap::default();
+    let (mut plain, mut indices) = (Vec::new(), Vec::with_capacity(ends.len()));
+    let mut s = 0usize;
+    for &e in ends {
+        let v = &bytes[s..e as usize];
+        s = e as usize;
+        let next = map.len() as u32;
+        let i = *map.entry(v).or_insert_with(|| {
+            plain.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            plain.extend_from_slice(v);
+            next
+        });
+        indices.push(i);
+    }
+    Dict { plain, count: map.len(), indices }
+}
+
+fn dict_ints<T: Copy + Eq + std::hash::Hash>(values: &[T], le: impl Fn(T, &mut Vec<u8>)) -> Dict {
+    let mut map: rustc_hash::FxHashMap<T, u32> = rustc_hash::FxHashMap::default();
+    let (mut plain, mut indices) = (Vec::new(), Vec::with_capacity(values.len()));
+    for &v in values {
+        let next = map.len() as u32;
+        let i = *map.entry(v).or_insert_with(|| {
+            le(v, &mut plain);
+            next
+        });
+        indices.push(i);
+    }
+    Dict { plain, count: map.len(), indices }
+}
+
+/// Bit width for indices into a dictionary of `count` entries (at least 1).
+fn bit_width(count: usize) -> u8 {
+    (usize::BITS - count.saturating_sub(1).leading_zeros()).max(1) as u8
+}
+
+/// Dictionary indices as a data-page body: the bit-width byte, then one bit-packed run
+/// (RLE/bit-packed hybrid, LSB first, groups of 8 values padded with zeros).
+fn packed_indices(indices: &[u32], width: u8, out: &mut Vec<u8>) {
+    out.push(width);
+    let groups = indices.len().div_ceil(8);
+    let mut h = ((groups as u64) << 1) | 1;
+    while h >= 0x80 {
+        out.push((h as u8) | 0x80);
+        h >>= 7;
+    }
+    out.push(h as u8);
+    let w = u32::from(width);
+    let (mut acc, mut bits) = (0u64, 0u32);
+    for g in 0..groups {
+        for k in 0..8 {
+            let v = u64::from(indices.get(g * 8 + k).copied().unwrap_or(0));
+            acc |= v << bits;
+            bits += w;
+            while bits >= 8 {
+                out.push(acc as u8);
+                acc >>= 8;
+                bits -= 8;
+            }
+        }
+    }
+    debug_assert_eq!(bits, 0);
+}
+
+fn dict_page_header(size: usize, count: usize) -> Vec<u8> {
+    let mut t = T::new();
+    t.i32f(1, 2); // DICTIONARY_PAGE
+    t.i32f(2, size as i32);
+    t.i32f(3, size as i32);
+    t.begin(7); // DictionaryPageHeader
+    t.i32f(1, count as i32);
+    t.i32f(2, 0); // PLAIN
+    t.end();
+    t.b.push(0);
+    t.b
 }
 
 /// Thrift compact protocol, just what the footer needs.
@@ -88,14 +180,14 @@ const BYTE_ARRAY: i32 = 6;
 const INT32: i32 = 1;
 const INT64: i32 = 2;
 
-fn page_header(uncompressed: usize, num_values: usize) -> Vec<u8> {
+fn page_header(uncompressed: usize, num_values: usize, encoding: i32) -> Vec<u8> {
     let mut t = T::new();
     t.i32f(1, 0); // DATA_PAGE
     t.i32f(2, uncompressed as i32);
     t.i32f(3, uncompressed as i32);
     t.begin(5); // DataPageHeader
     t.i32f(1, num_values as i32);
-    t.i32f(2, 0); // PLAIN
+    t.i32f(2, encoding); // PLAIN (0) or RLE_DICTIONARY (8)
     t.i32f(3, 3); // RLE (definition levels)
     t.i32f(4, 3); // RLE (repetition levels)
     t.end();
@@ -144,10 +236,32 @@ pub const MAX_PAGE: usize = 1 << 30;
 pub fn write(path: &std::path::Path, schema_name: &str, names: &[&str], cols: &[Col], rows: usize) -> std::io::Result<()> {
     let mut file = Vec::with_capacity(rows * 48 + 4096);
     file.extend_from_slice(b"PAR1");
-    let mut chunks = Vec::new(); // (type, name, offset, size, num_values)
+    let mut chunks = Vec::new(); // (type, name, data page offset, size, dictionary page offset)
     let mut page = Vec::new();
     for (name, col) in names.iter().zip(cols) {
         page.clear();
+        let dict = match col {
+            Col::StrDict { bytes, ends } | Col::OptStrDict { bytes, ends, .. } => Some((BYTE_ARRAY, dict_strings(bytes, ends))),
+            Col::DateDict(v) => Some((INT32, dict_ints(v, |x, out| out.extend_from_slice(&x.to_le_bytes())))),
+            Col::I64Dict(v) => Some((INT64, dict_ints(v, |x, out| out.extend_from_slice(&x.to_le_bytes())))),
+            _ => None,
+        };
+        if let Some((ty, d)) = dict {
+            let dict_offset = file.len();
+            let dh = dict_page_header(d.plain.len(), d.count);
+            file.extend_from_slice(&dh);
+            file.extend_from_slice(&d.plain);
+            if let Col::OptStrDict { present, .. } = col {
+                def_levels(present, &mut page);
+            }
+            packed_indices(&d.indices, bit_width(d.count), &mut page);
+            let header = page_header(page.len(), rows, 8);
+            let offset = file.len();
+            file.extend_from_slice(&header);
+            file.extend_from_slice(&page);
+            chunks.push((ty, *name, offset, file.len() - dict_offset, Some(dict_offset)));
+            continue;
+        }
         let ty = match col {
             Col::Str { bytes, ends } => {
                 plain_strings(bytes, ends, &mut page);
@@ -170,12 +284,13 @@ pub fn write(path: &std::path::Path, schema_name: &str, names: &[&str], cols: &[
                 }
                 INT64
             }
+            Col::StrDict { .. } | Col::OptStrDict { .. } | Col::DateDict(_) | Col::I64Dict(_) => unreachable!(),
         };
-        let header = page_header(page.len(), rows);
+        let header = page_header(page.len(), rows, 0);
         let offset = file.len();
         file.extend_from_slice(&header);
         file.extend_from_slice(&page);
-        chunks.push((ty, *name, offset, header.len() + page.len()));
+        chunks.push((ty, *name, offset, header.len() + page.len(), None));
     }
     // FileMetaData
     let mut t = T::new();
@@ -188,10 +303,10 @@ pub fn write(path: &std::path::Path, schema_name: &str, names: &[&str], cols: &[
     for (name, col) in names.iter().zip(cols) {
         t.begin_elem();
         let (ty, rep, conv, logical) = match col {
-            Col::Str { .. } => (BYTE_ARRAY, 0, Some(0), Some(1)),   // UTF8 / STRING
-            Col::OptStr { .. } => (BYTE_ARRAY, 1, Some(0), Some(1)),
-            Col::Date(_) => (INT32, 0, Some(6), Some(6)),           // DATE / DATE
-            Col::I64(_) => (INT64, 0, None, None),
+            Col::Str { .. } | Col::StrDict { .. } => (BYTE_ARRAY, 0, Some(0), Some(1)), // UTF8 / STRING
+            Col::OptStr { .. } | Col::OptStrDict { .. } => (BYTE_ARRAY, 1, Some(0), Some(1)),
+            Col::Date(_) | Col::DateDict(_) => (INT32, 0, Some(6), Some(6)),         // DATE / DATE
+            Col::I64(_) | Col::I64Dict(_) => (INT64, 0, None, None),
         };
         t.i32f(1, ty);
         t.i32f(3, rep);
@@ -212,14 +327,21 @@ pub fn write(path: &std::path::Path, schema_name: &str, names: &[&str], cols: &[
     t.begin_elem(); // RowGroup
     t.list(1, 12, chunks.len());
     let total: usize = chunks.iter().map(|c| c.3).sum();
-    for &(ty, name, offset, size) in &chunks {
+    for &(ty, name, offset, size, dict_offset) in &chunks {
         t.begin_elem(); // ColumnChunk
-        t.i64f(2, offset as i64);
+        t.i64f(2, dict_offset.unwrap_or(offset) as i64);
         t.begin(3); // ColumnMetaData
         t.i32f(1, ty);
-        t.list(2, 5, 2);
-        t.zz(0); // PLAIN
-        t.zz(3); // RLE
+        if dict_offset.is_some() {
+            t.list(2, 5, 3);
+            t.zz(0); // PLAIN (dictionary page)
+            t.zz(3); // RLE (definition levels)
+            t.zz(8); // RLE_DICTIONARY
+        } else {
+            t.list(2, 5, 2);
+            t.zz(0); // PLAIN
+            t.zz(3); // RLE
+        }
         t.list(3, 8, 1);
         t.varint(name.len() as u64);
         t.b.extend_from_slice(name.as_bytes());
@@ -228,6 +350,9 @@ pub fn write(path: &std::path::Path, schema_name: &str, names: &[&str], cols: &[
         t.i64f(6, size as i64);
         t.i64f(7, size as i64);
         t.i64f(9, offset as i64);
+        if let Some(d) = dict_offset {
+            t.i64f(11, d as i64); // dictionary_page_offset
+        }
         t.end();
         t.end();
     }
