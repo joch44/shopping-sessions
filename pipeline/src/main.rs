@@ -369,7 +369,7 @@ fn parse_chunk(
             for_each_record::<7>(bytes_of(&event_maps[chunk.file]), chunk.start, chunk.end, |fields, offset| {
                 let Some(event_id) = fields[0] else { return }; // step 1: empty event_id
                 let id = key_of(event_id, None);
-                let ingest = fields[3].and_then(|v| ts::parse_cached(v, &mut state.dates)).unwrap_or(NEVER);
+                let ingest = fields[3].and_then(|v| ts::parse_ingest(v, &mut state.dates)).unwrap_or(NEVER);
                 let seq = file_seq | offset as u64;
                 let copy = match judge(context, fields, ingest, &mut state.dates) {
                     Some((user, ts, price, category)) => EventCopy { id, user, seq, ingest, ts, price, category },

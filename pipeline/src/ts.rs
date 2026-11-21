@@ -56,9 +56,21 @@ pub fn parse(value: &[u8]) -> Option<i64> {
     parse_cached(value, &mut DateCache::default())
 }
 
-/// `parse` with a caller-owned date cache.
+/// `parse` with a caller-owned date cache. With AVX-512BW/VL, the hot shapes (F1, F2, F3 of
+/// 1..=16 digits) take a SIMD path with no length dispatch on the date-time fields; every
+/// other input, and any input that fails a fast-path check, goes to `parse_exact`, so the
+/// result is identical for every input.
 #[inline]
 pub fn parse_cached(value: &[u8], dates: &mut DateCache) -> Option<i64> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl"))]
+    return parse_simd(value, dates);
+    #[allow(unreachable_code)]
+    parse_exact(value, dates)
+}
+
+/// The exact parser (v11 body).
+#[inline]
+fn parse_exact(value: &[u8], dates: &mut DateCache) -> Option<i64> {
     let n = value.len();
     if n == 0 {
         return None;
@@ -139,9 +151,135 @@ pub fn parse_cached(value: &[u8], dates: &mut DateCache) -> Option<i64> {
     Some(local - offset_ms)
 }
 
+#[inline(always)]
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl"))]
+fn parse_simd(v: &[u8], dates: &mut DateCache) -> Option<i64> {
+    use std::arch::x86_64::*;
+    let n = v.len();
+    if n == 0 || n > 25 || (n > 16 && n != 20 && n != 25) {
+        return parse_exact(v, dates);
+    }
+    unsafe {
+        let k: __mmask32 = ((1u64 << n) - 1) as u32;
+        let x = _mm256_maskz_loadu_epi8(k, v.as_ptr().cast());
+        let d = _mm256_sub_epi8(x, _mm256_set1_epi8(b'0' as i8));
+        let digits = _mm256_mask_cmplt_epu8_mask(k, d, _mm256_set1_epi8(10));
+        if n <= 16 {
+            // F3: all digits (else bad: shorter than F1, cannot be a date-time).
+            if digits != k {
+                return None;
+            }
+            // right-align the n digits in 16 lanes, then 10/100/10^4 multiply-adds
+            let r = _mm_maskz_loadu_epi8((((1u32 << n) - 1) << (16 - n)) as u16, v.as_ptr().wrapping_sub(16 - n).cast());
+            let r = _mm_maskz_sub_epi8((((1u32 << n) - 1) << (16 - n)) as u16, r, _mm_set1_epi8(b'0' as i8));
+            let p2 = _mm_maddubs_epi16(r, _mm_set_epi8(1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10));
+            let p4 = _mm_madd_epi16(p2, _mm_set_epi16(1, 100, 1, 100, 1, 100, 1, 100));
+            let p4 = _mm_packus_epi32(p4, p4);
+            let p8 = _mm_madd_epi16(p4, _mm_set_epi16(1, 10000, 1, 10000, 1, 10000, 1, 10000));
+            let hi = _mm_cvtsi128_si32(p8) as u32 as i64;
+            let lo = _mm_extract_epi32::<1>(p8) as u32 as i64;
+            return Some(hi * 100_000_000 + lo);
+        }
+        if digits == k {
+            return parse_exact(v, dates); // 20 or 25 digits: F3 with leading zeros (exact path)
+        }
+        // F1 / F2: separators and digit positions by mask.
+        const DIG19: u32 = 0x6DB6F; // digit positions 0-3,5,6,8,9,11,12,14,15,17,18
+        let pat = _mm256_setr_epi8(
+            0, 0, 0, 0, b'-' as i8, 0, 0, b'-' as i8, 0, 0, b'T' as i8, 0, 0, b':' as i8, 0, 0, b':' as i8, 0, 0, b'Z' as i8, 0, 0, b':' as i8, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        );
+        let eq = _mm256_cmpeq_epi8_mask(x, pat);
+        const SEP19: u32 = 1 << 4 | 1 << 7 | 1 << 10 | 1 << 13 | 1 << 16;
+        let mut ok = (digits & DIG19 == DIG19) & (eq & SEP19 == SEP19);
+        let mut off = 0i64;
+        if n == 20 {
+            ok &= eq & (1 << 19) != 0;
+        } else {
+            let sign = v[19];
+            ok &= (sign == b'+' || sign == b'-') & (eq & (1 << 22) != 0) & (digits & 0b1_1011 << 20 == 0b1_1011 << 20);
+            if ok {
+                let (oh, om) = (i64::from(v[20] - b'0') * 10 + i64::from(v[21] - b'0'), i64::from(v[23] - b'0') * 10 + i64::from(v[24] - b'0'));
+                ok &= oh <= 23 && om <= 59;
+                off = (oh * 60 + om) * 60_000;
+                if sign == b'-' {
+                    off = -off;
+                }
+            }
+        }
+        if !ok {
+            return None;
+        }
+        // pairs at 0,2 (century, year), 5 (month), 8 (day), 11, 14, 17: gather the 14 digit
+        // bytes into 7 adjacent pairs with one in-lane shuffle of the low 16 + high 3 bytes.
+        let d128 = _mm256_castsi256_si128(d);
+        let dhi = _mm256_extracti128_si256::<1>(d);
+        // low 16 bytes hold positions 0..15: pairs 0-1,2-3,5-6,8-9,11-12,14-15
+        let g = _mm_shuffle_epi8(d128, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1));
+        // positions 17,18 are bytes 1,2 of the high lane
+        let g = _mm_or_si128(g, _mm_bslli_si128::<12>(_mm_shuffle_epi8(dhi, _mm_setr_epi8(1, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1))));
+        let p = _mm_maddubs_epi16(g, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0));
+        let mut f = [0u16; 8];
+        _mm_storeu_si128(f.as_mut_ptr().cast(), p);
+        let year = i64::from(f[0]) * 100 + i64::from(f[1]);
+        let (month, day, hour, minute, second) = (i64::from(f[2]), i64::from(f[3]), i64::from(f[4]), i64::from(f[5]), i64::from(f[6]));
+        if !(1..=12).contains(&month) {
+            return None;
+        }
+        const DAYS: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let md = if month == 2 && leap { 29 } else { DAYS[(month - 1) as usize] };
+        if day < 1 || day > md || hour > 23 || minute > 59 || second > 59 {
+            return None;
+        }
+        // same DateCache arithmetic as cts (via its public parse on a canonical F1 is too slow):
+        let local = (dates.days(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second) * 1_000;
+        Some(local - off)
+    }
+}
+
+/// `ingest_ts`, which rules.md guarantees is always valid F1 ("`ingest_ts` is always valid
+/// F1"): a 20-byte value ending in `Z` is read at fixed offsets with no validation, its date
+/// through the month cache. Anything else (an empty or odd field in hand-made input, an
+/// all-digit value of F1's length) takes the exact parser.
+#[inline]
+pub fn parse_ingest(value: &[u8], dates: &mut DateCache) -> Option<i64> {
+    if value.len() != 20 || value[19] != b'Z' {
+        return parse_cached(value, dates);
+    }
+    let d = |i: usize| i64::from(value[i].wrapping_sub(b'0'));
+    let year = d(0) * 1000 + d(1) * 100 + d(2) * 10 + d(3);
+    let (month, day) = (d(5) * 10 + d(6), d(8) * 10 + d(9));
+    let seconds = (d(11) * 10 + d(12)) * 3_600 + (d(14) * 10 + d(15)) * 60 + d(17) * 10 + d(18);
+    Some((dates.days(year, month, day) * 86_400 + seconds) * 1_000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ingest_fast_path_equals_exact_parser_on_valid_f1_and_falls_back_otherwise() {
+        let mut a = DateCache::default();
+        let mut b = DateCache::default();
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..200_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let year = 1970 + (x % 130) as i64;
+            let month = 1 + ((x >> 8) % 12) as i64;
+            let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+            let mdays = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][(month - 1) as usize];
+            let day = 1 + ((x >> 16) % mdays) as i64;
+            let (h, mi, s) = ((x >> 24) % 24, (x >> 32) % 60, (x >> 40) % 60);
+            let v = format!("{year:04}-{month:02}-{day:02}T{h:02}:{mi:02}:{s:02}Z");
+            assert_eq!(parse_ingest(v.as_bytes(), &mut a), parse_cached(v.as_bytes(), &mut b), "{v}");
+        }
+        for v in ["", "ingest_ts", "00000001791071890000", "18446744073709551616", "1791071890000", "2026-10-03T19:58:10-04:00", "2026-10-03T23:58:10z"] {
+            assert_eq!(parse_ingest(v.as_bytes(), &mut a), parse_cached(v.as_bytes(), &mut b), "{v}");
+        }
+    }
+
 
     fn two(bytes: &[u8]) -> i64 {
         i64::from(bytes[0] - b'0') * 10 + i64::from(bytes[1] - b'0')
