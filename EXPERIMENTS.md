@@ -71,6 +71,7 @@ Mirror VM: 3.01 s @20M, 8.81 s @60M. All outputs match.
 | v31 | research one-pass grouping in sessions | 1.27 | 3.28 | interleaved vs v30: 1.283 / 3.336; **submitted: 1.13 s on the grader** |
 | v32 | remove v26 parallel exit teardown (could zero live thread stacks: no-THP build segfaulted on GCP) | 1.27 | | crash fix |
 | v33 | communicator: mallopt ARENA_MAX 1 + TOP_PAD 64 MiB (research finding: mmap_lock convoys on kernel 6.1) | | | **graded 1.09 s** (v31 1.13) |
+| v34 | + mallopt MMAP_THRESHOLD 64 MiB, TRIM_THRESHOLD 256 MiB (research) | 0.96* | 2.94* | GCP 20M 1.180 (= v33), GCP 60M 3.47 -> 3.22; *direct runs, not docker |
 
 Calibration: v9 mirror 2.24 s vs grader 1.97 s -> factor 0.878 (tools/to_board.py). Target <1.0 s grader
 ~= 1.1 s mirror. Container start/stop floor ~0.34 s (research): in-process budget ~0.75 s @20M.
