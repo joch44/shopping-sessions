@@ -1,0 +1,104 @@
+/home/azureuser/osu/data/dev-s1 evperm 0.00002 1
+/home/azureuser/osu/data/dev-s1 evperm 0.00002 1 --late
+/home/azureuser/osu/data/dev-s1 tsswap 0.001 1
+/home/azureuser/osu/data/dev-s1 tsswap 0.001 1 --late
+/home/azureuser/osu/data/dev-s1 tsswap 0.00005 1
+/home/azureuser/osu/data/dev-s1 tsswap 0.00005 1 --late
+/home/azureuser/osu/data/dev-s1 userperm 0.001 1
+/home/azureuser/osu/data/dev-s1 userperm 0.001 1 --late
+/home/azureuser/osu/data/dev-s1 userperm 0.00002 1
+/home/azureuser/osu/data/dev-s1 userperm 0.00002 1 --late
+/home/azureuser/osu/data/dev-s1 xlink 0.001 1
+/home/azureuser/osu/data/dev-s1 xlink 0.001 1 --late
+/home/azureuser/osu/data/dev-s1 xlink 0.00002 1
+/home/azureuser/osu/data/dev-s1 xlink 0.00002 1 --late
+/home/azureuser/osu/data/dev-s1 dellink 0.01 1
+/home/azureuser/osu/data/dev-s1 dellink 0.01 1 --late
+/home/azureuser/osu/data/dev-s1 dellink 0.0005 1
+/home/azureuser/osu/data/dev-s1 dellink 0.0005 1 --late
+/home/azureuser/osu/data/dev-s1 zero 0.001 1
+/home/azureuser/osu/data/dev-s1 zero 0.001 1 --late
+/home/azureuser/osu/data/dev-s1 zero 0.00002 1
+/home/azureuser/osu/data/dev-s1 zero 0.00002 1 --late
+/home/azureuser/osu/data/dev-s1 fresh 0.001 1
+/home/azureuser/osu/data/dev-s1 fresh 0.001 1 --late
+/home/azureuser/osu/data/dev-s1 fresh 0.00002 1
+/home/azureuser/osu/data/dev-s1 fresh 0.00002 1 --late
+/home/azureuser/osu/data/dev-s1 evperm 0.00002 2
+/home/azureuser/osu/data/dev-s1 evperm 0.00002 2 --late
+/home/azureuser/osu/data/dev-s1 tsswap 0.001 2
+/home/azureuser/osu/data/dev-s1 tsswap 0.001 2 --late
+/home/azureuser/osu/data/dev-s1 tsswap 0.00005 2
+/home/azureuser/osu/data/dev-s1 tsswap 0.00005 2 --late
+/home/azureuser/osu/data/dev-s1 userperm 0.001 2
+/home/azureuser/osu/data/dev-s1 userperm 0.001 2 --late
+/home/azureuser/osu/data/dev-s1 userperm 0.00002 2
+/home/azureuser/osu/data/dev-s1 userperm 0.00002 2 --late
+/home/azureuser/osu/data/dev-s1 xlink 0.001 2
+/home/azureuser/osu/data/dev-s1 xlink 0.001 2 --late
+/home/azureuser/osu/data/dev-s1 xlink 0.00002 2
+/home/azureuser/osu/data/dev-s1 xlink 0.00002 2 --late
+/home/azureuser/osu/data/dev-s1 dellink 0.01 2
+/home/azureuser/osu/data/dev-s1 dellink 0.01 2 --late
+/home/azureuser/osu/data/dev-s1 dellink 0.0005 2
+/home/azureuser/osu/data/dev-s1 dellink 0.0005 2 --late
+/home/azureuser/osu/data/dev-s1 zero 0.001 2
+/home/azureuser/osu/data/dev-s1 zero 0.001 2 --late
+/home/azureuser/osu/data/dev-s1 zero 0.00002 2
+/home/azureuser/osu/data/dev-s1 zero 0.00002 2 --late
+/home/azureuser/osu/data/dev-s1 fresh 0.001 2
+/home/azureuser/osu/data/dev-s1 fresh 0.001 2 --late
+/home/azureuser/osu/data/dev-s1 fresh 0.00002 2
+/home/azureuser/osu/data/dev-s1 fresh 0.00002 2 --late
+/home/azureuser/osu/data/medium-s101 evperm 0.00002 1
+/home/azureuser/osu/data/medium-s101 evperm 0.00002 1 --late
+/home/azureuser/osu/data/medium-s101 tsswap 0.001 1
+/home/azureuser/osu/data/medium-s101 tsswap 0.001 1 --late
+/home/azureuser/osu/data/medium-s101 tsswap 0.00005 1
+/home/azureuser/osu/data/medium-s101 tsswap 0.00005 1 --late
+/home/azureuser/osu/data/medium-s101 userperm 0.001 1
+/home/azureuser/osu/data/medium-s101 userperm 0.001 1 --late
+/home/azureuser/osu/data/medium-s101 userperm 0.00002 1
+/home/azureuser/osu/data/medium-s101 userperm 0.00002 1 --late
+/home/azureuser/osu/data/medium-s101 xlink 0.001 1
+/home/azureuser/osu/data/medium-s101 xlink 0.001 1 --late
+/home/azureuser/osu/data/medium-s101 xlink 0.00002 1
+/home/azureuser/osu/data/medium-s101 xlink 0.00002 1 --late
+/home/azureuser/osu/data/medium-s101 dellink 0.01 1
+/home/azureuser/osu/data/medium-s101 dellink 0.01 1 --late
+/home/azureuser/osu/data/medium-s101 dellink 0.0005 1
+/home/azureuser/osu/data/medium-s101 dellink 0.0005 1 --late
+/home/azureuser/osu/data/medium-s101 zero 0.001 1
+/home/azureuser/osu/data/medium-s101 zero 0.001 1 --late
+/home/azureuser/osu/data/medium-s101 zero 0.00002 1
+/home/azureuser/osu/data/medium-s101 zero 0.00002 1 --late
+/home/azureuser/osu/data/medium-s101 fresh 0.001 1
+/home/azureuser/osu/data/medium-s101 fresh 0.001 1 --late
+/home/azureuser/osu/data/medium-s101 fresh 0.00002 1
+/home/azureuser/osu/data/medium-s101 fresh 0.00002 1 --late
+/home/azureuser/osu/data/medium-s101 evperm 0.00002 2
+/home/azureuser/osu/data/medium-s101 evperm 0.00002 2 --late
+/home/azureuser/osu/data/medium-s101 tsswap 0.001 2
+/home/azureuser/osu/data/medium-s101 tsswap 0.001 2 --late
+/home/azureuser/osu/data/medium-s101 tsswap 0.00005 2
+/home/azureuser/osu/data/medium-s101 tsswap 0.00005 2 --late
+/home/azureuser/osu/data/medium-s101 userperm 0.001 2
+/home/azureuser/osu/data/medium-s101 userperm 0.001 2 --late
+/home/azureuser/osu/data/medium-s101 userperm 0.00002 2
+/home/azureuser/osu/data/medium-s101 userperm 0.00002 2 --late
+/home/azureuser/osu/data/medium-s101 xlink 0.001 2
+/home/azureuser/osu/data/medium-s101 xlink 0.001 2 --late
+/home/azureuser/osu/data/medium-s101 xlink 0.00002 2
+/home/azureuser/osu/data/medium-s101 xlink 0.00002 2 --late
+/home/azureuser/osu/data/medium-s101 dellink 0.01 2
+/home/azureuser/osu/data/medium-s101 dellink 0.01 2 --late
+/home/azureuser/osu/data/medium-s101 dellink 0.0005 2
+/home/azureuser/osu/data/medium-s101 dellink 0.0005 2 --late
+/home/azureuser/osu/data/medium-s101 zero 0.001 2
+/home/azureuser/osu/data/medium-s101 zero 0.001 2 --late
+/home/azureuser/osu/data/medium-s101 zero 0.00002 2
+/home/azureuser/osu/data/medium-s101 zero 0.00002 2 --late
+/home/azureuser/osu/data/medium-s101 fresh 0.001 2
+/home/azureuser/osu/data/medium-s101 fresh 0.001 2 --late
+/home/azureuser/osu/data/medium-s101 fresh 0.00002 2
+/home/azureuser/osu/data/medium-s101 fresh 0.00002 2 --late
