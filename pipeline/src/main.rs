@@ -756,6 +756,18 @@ fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>]
     table.resize(slots, EMPTY);
     winner.clear();
     winner.resize(total, false);
+    // A user that does not pack is a per-thread side-table reference, so two identical copies
+    // can carry different references: compare such users by their key (equal keys <=> equal
+    // bytes). Comparing the raw fields made every long-user_id duplicate pair with equal
+    // ingest_ts look like a conflict and re-ran the whole job (found by the middleman session).
+    let resolve = |user: u64| {
+        if user & compact::SLOW_USER != 0 {
+            slow_users[((user >> 40) & 0x7F_FFFF) as usize][(user & 0xFF_FFFF_FFFF) as usize]
+        } else {
+            compact::unpack62_key(user)
+        }
+    };
+    let same_user = |a: u64, b: u64| a == b || ((a | b) & compact::SLOW_USER != 0 && resolve(a) == resolve(b));
     let mut index: u32 = 0;
     for copy in pieces.iter().copied().flatten() {
         let h = compact::mix64(copy.id);
@@ -778,7 +790,9 @@ fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>]
                         table[slot] = (tag << 32) | u64::from(index);
                         winner[other_index as usize] = false;
                         winner[index as usize] = true;
-                    } else if copy.ingest == other.ingest && (copy.user, copy.ts, copy.price_cat) != (other.user, other.ts, other.price_cat) {
+                    } else if copy.ingest == other.ingest
+                        && (copy.ts != other.ts || copy.price_cat != other.price_cat || !same_user(copy.user, other.user))
+                    {
                         // Equal ingest_ts but different copies: impossible under rules.md (Events
                         // step 2). The reference then keeps the first copy in file order, which
                         // this record cannot see: rerun the whole job on the exact 64-byte path.
@@ -794,11 +808,7 @@ fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>]
     survivors32.clear();
     for (copy, &won) in pieces.iter().copied().flatten().zip(winner.iter()) {
         if won && copy.price_cat != compact::INVALID32 {
-            let user = if copy.user & compact::SLOW_USER != 0 {
-                slow_users[((copy.user >> 40) & 0x7F_FFFF) as usize][(copy.user & 0xFF_FFFF_FFFF) as usize]
-            } else {
-                compact::unpack62_key(copy.user)
-            };
+            let user = resolve(copy.user);
             survivors32.push((user, copy.ts, copy.price_cat));
         }
     }

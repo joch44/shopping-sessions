@@ -18,13 +18,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import compare  # noqa: E402
 
 
-def run_case(case_dir, command):
+def run_case(case_dir, command, forbid=None):
     with tempfile.TemporaryDirectory() as output, tempfile.TemporaryDirectory() as scratch:
         env = dict(os.environ, DATA_DIR=os.path.join(case_dir, "input"), OUTPUT_DIR=output,
                    SCRATCH_DIR=scratch)
         process = subprocess.run(command + [env["DATA_DIR"], output], env=env, capture_output=True, text=True, timeout=600)
         if process.returncode != 0:
             return False, [f"exit {process.returncode}", process.stderr[-1500:]]
+        if forbid and forbid in process.stderr:
+            return False, [f"stderr contains forbidden text {forbid!r}:", process.stderr[-1500:]]
         problems = []
         try:
             actual = {t: compare.load(output, t, problems) for t in compare.TABLES}
@@ -45,11 +47,14 @@ def run_case(case_dir, command):
 def main(argv):
     split = argv.index("--")
     roots, command = argv[:split], argv[split + 1:]
+    forbid = None
+    if roots and roots[0].startswith("--forbid-stderr="):
+        forbid = roots.pop(0).split("=", 1)[1]  # e.g. a fallback that must not trigger
     cases = sorted(os.path.join(root, name) for root in roots for name in os.listdir(root)
                    if os.path.isdir(os.path.join(root, name, "input")))
     failed = []
     for case_dir in cases:
-        ok, lines = run_case(case_dir, command)
+        ok, lines = run_case(case_dir, command, forbid)
         name = os.path.relpath(case_dir)
         print(f"{'ok  ' if ok else 'FAIL'} {name}")
         if not ok:

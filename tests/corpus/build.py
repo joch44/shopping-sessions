@@ -228,6 +228,17 @@ case("ts_window_longer_than_2_pow_32_ms",
 
 # ============================================================== events: dedup, validation, lateness
 
+LONG_U = "user_with_a_rather_long_id_0001"  # 31 chars: does not pack into 62 bits
+case("dedup_identical_copies_equal_ingest_long_user_id",
+     "two identical copies (same ingest_ts) of one purchase by a 31-char user_id, in two files; "
+     "the 32-byte path must treat them as one event without re-running the job",
+     files={"events/part-00000.csv": raw([ev("e1", LONG_U, T(3, "10:00:00"), kind="purchase", price="500")],
+                                        EVENT_HEADER),
+            "events/part-00001.csv": raw([ev("e1", LONG_U, T(3, "10:00:00"), kind="purchase", price="500"),
+                                         ev("e2", LONG_U, T(3, "10:01:00"))],
+                                        EVENT_HEADER)},
+     users=[(LONG_U, D3, 1, 2, 500, "shoes")], campaigns=[ORG(D3, 1, 1, 500)])
+
 case("dedup_earliest_copy_invalid_type_kills_event",
      "Earliest copy has type `Purchase`; the later valid copy does not rescue it",
      events=[ev("e1", "u1", T(3), T(3, "10:01:00"), kind="Purchase", price="500"),

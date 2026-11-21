@@ -24,7 +24,7 @@ fixtures:
 	  || { $(PY) tests/run_cases.py $(FIXTURES) -- $(IMPL) | grep -v '^ok'; exit 1; }
 
 corpus: corpus-cases
-	@echo "== hand-made corpus"; out=$$($(PY) tests/run_cases.py $(CORPUS) -- $(IMPL)); \
+	@echo "== hand-made corpus"; out=$$($(PY) tests/run_cases.py --forbid-stderr=rerunning $(CORPUS) -- $(IMPL)); \
 	  echo "$$out" | tail -1; echo "$$out" | tail -1 | grep -qE '^([0-9]+)/\1 ' || { echo "$$out" | grep -v '^ok'; exit 1; }
 
 dev:
