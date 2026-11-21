@@ -62,7 +62,8 @@ Mirror VM: 3.01 s @20M, 8.81 s @60M. All outputs match.
 | v22 | SIMD timestamps (parser session) + ingest_ts fast path (research; relies on the rules' F1 guarantee) | 1.53 | 4.12 | parse events 0.63 -> 0.53 s; research A/B vs v21: 1.65 -> 1.52 / 4.56 -> 4.17 |
 | v23 | links resolved in parallel, still overlapped with event parsing (research) | 1.54 | 4.16 | tie with v22 (research A/B 1.507/1.514); links ~0.08 s of parallel work at 20M |
 | v24 | PGO (communicator session), profile from never-timed datasets via tools/pgo.sh | 1.46 | 3.99 | interleaved vs v23: 1.50 / 4.16 |
-| v25 | PEXT splitter (parser session) + regenerated profile | 1.40 | 3.63 | parse events 0.38 s @20M / 1.11 s @60M; research A/B on v23: 1.565 -> 1.414 s |
+| v25 | PEXT splitter (parser session) + regenerated profile | 1.40 | 3.63 | **submitted: 1.18 s on the grader** | parse events 0.38 s @20M / 1.11 s @60M; research A/B on v23: 1.565 -> 1.414 s |
+| v26 | exit inside run(), parallel MADV_DONTNEED of regions > 64 MiB (scouter session) | 1.35 | 3.56 | interleaved vs v25: 1.364 / 3.595 (tiny; analysis-VM gain mostly does not transfer) |
 
 Calibration: v9 mirror 2.24 s vs grader 1.97 s -> factor 0.878 (tools/to_board.py). Target <1.0 s grader
 ~= 1.1 s mirror. Container start/stop floor ~0.34 s (research): in-process budget ~0.75 s @20M.
