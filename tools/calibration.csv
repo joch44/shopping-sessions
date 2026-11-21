@@ -1,0 +1,2 @@
+# date,submission,commit,dataset_events,sim_seconds,board_seconds,notes
+2026-11-21,shopping-sessions-reference,37157eb,20000000,123.7,124,"Python reference; sim = mean of 4 runs on p20m seeds 11-13 (cold 122.4, warm 121.7/124.0/126.8); CPU-bound"
