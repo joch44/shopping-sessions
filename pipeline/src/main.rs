@@ -201,6 +201,30 @@ fn mostly_packable(maps: &[Option<Mmap>]) -> bool {
     unpackable * 50 <= rows
 }
 
+/// Whether more than 2% of sampled event rows have a user_id over 15 bytes (a long key):
+/// only then do sessions name persons from event lines (seq beside every Event, event files
+/// kept mapped); with few long IDs, recording them per row is cheaper.
+fn many_long_users(maps: &[Option<Mmap>]) -> bool {
+    let files: Vec<&[u8]> = maps.iter().map(bytes_of).filter(|b| !b.is_empty()).collect();
+    let step = files.len().div_ceil(16).max(1);
+    let (mut rows, mut long) = (0usize, 0usize);
+    for data in files.iter().step_by(step) {
+        let Some(first) = memchr::memchr(b'\n', data) else { continue };
+        let end = data.len().min(first + 1 + (256 << 10));
+        let mut seen = 0;
+        for_each_record::<7>(data, first + 1, end, |fields, _| {
+            if seen < 2048 {
+                seen += 1;
+                rows += 1;
+                if fields[1].is_some_and(|user| user.len() > 15) {
+                    long += 1;
+                }
+            }
+        });
+    }
+    long * 50 > rows
+}
+
 fn bytes_of(map: &Option<Mmap>) -> &[u8] {
     map.as_deref().unwrap_or(&[])
 }
@@ -1449,7 +1473,12 @@ fn run() -> Result<()> {
         && window.1.saturating_sub(window.0) < (1i64 << 32)
         && std::env::var_os("PIPE_LEGACY").is_none()
         && mostly_packable(&event_maps);
-    let name_from_lines = !compact && std::env::var("NAME_FROM_LINES").as_deref() != Ok("0");
+    let name_from_lines = !compact
+        && match std::env::var("NAME_FROM_LINES").as_deref() {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => many_long_users(&event_maps),
+        };
     let context = Context { window, products, unknown_category, campaigns, longs: LongIds::default(), compact, name_from_lines };
 
     // A+B. Task 0 resolves links while the other threads parse events (largest chunks
