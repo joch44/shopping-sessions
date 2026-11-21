@@ -5,6 +5,7 @@ mod core;
 mod events;
 mod iface;
 mod k_ref;
+mod k_ours;
 mod keyrec;
 mod links;
 mod out;
