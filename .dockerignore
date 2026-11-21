@@ -2,3 +2,4 @@
 !pipeline/Cargo.toml
 !pipeline/Cargo.lock
 !pipeline/src
+!pipeline/pgo

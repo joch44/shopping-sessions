@@ -6,7 +6,10 @@ FROM rust:1.100.0-slim-bookworm AS build
 WORKDIR /src
 COPY pipeline/Cargo.toml pipeline/Cargo.lock ./
 COPY pipeline/src ./src
-ENV RUSTFLAGS="-C target-cpu=cascadelake -C target-feature=+crt-static"
+# Profile-guided optimization: pipeline/pgo/merged.profdata, regenerated with tools/pgo.sh
+# (make pgo) before each submission. It only changes code layout and inlining.
+COPY pipeline/pgo ./pgo
+ENV RUSTFLAGS="-C target-cpu=cascadelake -C target-feature=+crt-static -Cprofile-use=/src/pgo/merged.profdata"
 RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \
  && cp target/x86_64-unknown-linux-gnu/release/pipeline /pipeline \
  && chmod 0755 /pipeline

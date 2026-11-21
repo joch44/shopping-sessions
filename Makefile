@@ -11,7 +11,7 @@ CORPUS   := tests/corpus/cases
 TINY_N   ?= 40
 FUZZ_N   ?= 60
 
-.PHONY: check deep corpus fixtures corpus-cases dev tiny fuzz medium parsegate
+.PHONY: check deep corpus fixtures corpus-cases dev tiny fuzz medium parsegate pgo shipped
 
 check: fixtures corpus dev tiny fuzz parsegate
 	@echo "== QUICK GATE PASSED"
@@ -68,3 +68,13 @@ deep: check
 	    rm -rf $$a $$b $$s; done; [ $$fail -eq 0 ]
 	@$(MAKE) --no-print-directory fuzz FUZZ_N=1000
 	@echo "== DEEP GATE PASSED"
+
+# Profile-guided optimization: regenerate the profile for the current code (before each submission).
+pgo:
+	@tools/pgo.sh
+
+# The binary exactly as the Dockerfile builds it (PGO profile, static, Cascade Lake): gate this one.
+SHIPPED := /tmp/claude-1000/cargo-shipped/x86_64-unknown-linux-gnu/release/pipeline
+shipped:
+	@cd pipeline && . ~/.cargo/env && RUSTFLAGS="-C target-cpu=cascadelake -C target-feature=+crt-static -Cprofile-use=$(CURDIR)/pipeline/pgo/merged.profdata" \
+	  CARGO_TARGET_DIR=/tmp/claude-1000/cargo-shipped cargo build --release --locked --target x86_64-unknown-linux-gnu -q && echo $(SHIPPED)
