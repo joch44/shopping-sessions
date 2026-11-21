@@ -9,7 +9,7 @@ COPY pipeline/src ./src
 # Profile-guided optimization: pipeline/pgo/merged.profdata, regenerated with tools/pgo.sh
 # (make pgo) before each submission. It only changes code layout and inlining.
 COPY pipeline/pgo ./pgo
-ENV RUSTFLAGS="-C target-cpu=cascadelake -C target-feature=+crt-static -Cprofile-use=/src/pgo/merged.profdata"
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static -Cprofile-use=/src/pgo/merged.profdata"
 RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \
  && cp target/x86_64-unknown-linux-gnu/release/pipeline /pipeline \
  && chmod 0755 /pipeline
