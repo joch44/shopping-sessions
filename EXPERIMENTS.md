@@ -64,6 +64,10 @@ Mirror VM: 3.01 s @20M, 8.81 s @60M. All outputs match.
 | v24 | PGO (communicator session), profile from never-timed datasets via tools/pgo.sh | 1.46 | 3.99 | interleaved vs v23: 1.50 / 4.16 |
 | v25 | PEXT splitter (parser session) + regenerated profile | 1.40 | 3.63 | **submitted: 1.18 s on the grader** | parse events 0.38 s @20M / 1.11 s @60M; research A/B on v23: 1.565 -> 1.414 s |
 | v26 | exit inside run(), parallel MADV_DONTNEED of regions > 64 MiB (scouter session) | 1.35 | 3.56 | interleaved vs v25: 1.364 / 3.595 (tiny; analysis-VM gain mostly does not transfer) |
+| v27 | partition counts from input size (4096 above ~30M events) + dedup table index above partition bits | | | 60M stage A/B: dedup 0.81 -> 0.69, sessions 0.71 -> 0.64 |
+| v28 | scouter: products loader, parallel startup, counter merge on writer thread, 4 MiB click chunks, CLICK_BATCH 64 | | | |
+| v29 | research: incremental assists window | 1.30 | 3.26 | interleaved vs v26: 1.348 / 3.596 (-0.34 s at 60M) |
+| v30 | research ts32 sessions (u32 offsets, i64 fallback for long windows added here) + plain click keys | PENDING | | |
 
 Calibration: v9 mirror 2.24 s vs grader 1.97 s -> factor 0.878 (tools/to_board.py). Target <1.0 s grader
 ~= 1.1 s mirror. Container start/stop floor ~0.34 s (research): in-process budget ~0.75 s @20M.
@@ -71,6 +75,9 @@ Calibration: v9 mirror 2.24 s vs grader 1.97 s -> factor 0.878 (tools/to_board.p
 Lessons: analysis-VM (Zen 5, 16 cores) gains roughly halve on the mirror (Ice Lake, 4 cores x 2 HT);
 memory-layout changes must be A/B'd on the mirror, interleaved (run-to-run drift is ~2-4%).
 
+Rejected (measured, mirror, interleaved vs v29): click parsing and dedup interleaved in one pool for
+hyperthread mixing (20M 1.288 -> 1.316 s, 60M 3.29 -> 3.32 s; outputs correct).
+Rejected (measured, research, mirror): sequential-append dedup (+0.075 s @20M, +0.11 s @60M).
 Rejected (measured, scouter session, analysis VM): two-pass events (competitor design: pass 1 dedups
 on event_id only, pass 2 parses winners straight into person shards): outputs correct but 20M +0.11 s,
 60M +0.28 s. Prototype kept on branch scout-twopass for the record.
