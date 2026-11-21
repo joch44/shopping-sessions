@@ -9,3 +9,4 @@ tools/floor/target/
 tools/generator/target/
 __pycache__/
 pipeline/target/
+tools/dashboard/index.json
