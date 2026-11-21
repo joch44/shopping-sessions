@@ -75,3 +75,17 @@ Rejected (measured): v16 one pool for clicks + dedup (no change); 2048/4096 dedu
 retractions (correct, slower); radix sort for sessions (research: no gain over counting sort).
 Rejected earlier: GLIBC_TUNABLES hugetlb (88 MB of 4.4 GB got huge pages); THP threshold 1 MiB (v8);
 shared global dedup table (feasibility, 1.7x slower); software write-combining (no gain on Ice Lake, research).
+
+## Target < 0.8 s on the board (~0.9 s mirror, ~0.55 s in-process @20M): no idle core
+
+Known serial sections / barriers in v22 (sent to the research session, which instruments a per-thread
+busy/idle timeline on the mirror and sends patches for every gap > ~5 ms):
+1. startup on one thread: manifest + products/campaigns lookups + per-file mmap (~0.023 s)
+2. links on ONE thread (~0.25 s CPU) inside the events pool -> research parallel-links patch
+3. barrier + respawn after the events pool; clicks wait on links (patch: parse clicks without people)
+4. dedup waits on people (person lookup in its emit loop)
+5. serial person-partition weighting + sort; sessions skew from whale partitions (heaviest first)
+6. serial merge of 8 dense campaign-counter arrays; output join; four thread spawns per run
+7. exit teardown in the kernel (~0.11 s, at the container floor)
+Ownership: links/clicks/people handoff and the timeline = research; parser = parser session;
+this session ports, gates in 4 configs, mirror-verifies and commits.
