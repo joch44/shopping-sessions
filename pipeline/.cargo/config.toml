@@ -1,0 +1,3 @@
+# The scorer is Cascade Lake or newer: never `native` (our VMs have instructions it lacks).
+[build]
+rustflags = ["-C", "target-cpu=cascadelake"]

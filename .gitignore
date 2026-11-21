@@ -8,3 +8,4 @@ tests/fuzz-failures/
 tools/floor/target/
 tools/generator/target/
 __pycache__/
+pipeline/target/
