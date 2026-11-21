@@ -39,7 +39,7 @@ unsafe fn map_huge(size: usize) -> *mut u8 {
         if tail > 0 {
             libc::munmap((aligned + length) as *mut libc::c_void, tail);
         }
-        libc::madvise(aligned as *mut libc::c_void, length, libc::MADV_HUGEPAGE);
+        // NO-THP build (grader A/B): no MADV_HUGEPAGE hint; everything else unchanged.
         aligned as *mut u8
     }
 }
@@ -74,7 +74,7 @@ unsafe impl GlobalAlloc for HugeAlloc {
                 if moved == libc::MAP_FAILED {
                     return std::ptr::null_mut();
                 }
-                libc::madvise(moved, new, libc::MADV_HUGEPAGE);
+                // NO-THP build (grader A/B): no MADV_HUGEPAGE hint.
                 moved.cast()
             },
             (false, false) => unsafe { System.realloc(ptr, layout, new_size) },
