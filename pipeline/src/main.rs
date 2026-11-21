@@ -1326,6 +1326,10 @@ fn main() {
     unsafe {
         libc::mallopt(libc::M_ARENA_MAX, 1);
         libc::mallopt(libc::M_TOP_PAD, 64 << 20);
+        // Keep blocks under 64 MiB in the heap and never trim it: fewer mmap/munmap writers
+        // (research session; GCP 60M 3.47 -> 3.22 s, 20M and Azure neutral).
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 64 << 20);
+        libc::mallopt(libc::M_TRIM_THRESHOLD, 256 << 20);
     }
     match run() {
         // Outputs are written and closed: exit at once instead of freeing gigabytes.
