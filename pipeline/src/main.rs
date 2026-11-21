@@ -702,14 +702,52 @@ struct DedupScratch {
 
 // ---------------------------------------------------------------- sessions, attribution, aggregation
 
-/// One event within a person's group: the person is the group's, so only what the session
-/// sweep reads (16 bytes, half an Event) is moved by the per-person sort.
-#[derive(Clone, Copy)]
-pub struct SessionEvent {
-    pub ts: i64,
+/// A timestamp stored as an offset from window_start within a person's group: u32 (4 bytes)
+/// whenever the window spans fewer than 2^32 ms (~49.7 days; every real dataset), i64 for a
+/// longer window, which the rules do not forbid. One session implementation serves both.
+trait TsOffset: Copy + Ord + Default {
+    fn from_rel(rel: i64) -> Self;
+    fn rel(self) -> i64;
+    /// This offset type's scratch in the per-thread state.
+    fn scratch(state: &mut PeopleState) -> &mut GroupScratch<Self>;
+}
+
+impl TsOffset for u32 {
+    #[inline(always)]
+    fn from_rel(rel: i64) -> Self {
+        rel as u32 // callers use u32 only when every rel fits: 0 <= rel < 2^32
+    }
+    #[inline(always)]
+    fn rel(self) -> i64 {
+        i64::from(self)
+    }
+    fn scratch(state: &mut PeopleState) -> &mut GroupScratch<Self> {
+        &mut state.scratch
+    }
+}
+
+impl TsOffset for i64 {
+    #[inline(always)]
+    fn from_rel(rel: i64) -> Self {
+        rel
+    }
+    #[inline(always)]
+    fn rel(self) -> i64 {
+        self
+    }
+    fn scratch(state: &mut PeopleState) -> &mut GroupScratch<Self> {
+        &mut state.scratch_wide
+    }
+}
+
+/// One purchase within a person's group (events store only their ts offset).
+#[derive(Clone, Copy, Default)]
+struct Purchase<T> {
+    pub ts: T, // ms since window_start
     pub price: u32,
     pub category: u32,
 }
+
 
 /// One click within a person's group (32 bytes instead of 48).
 #[derive(Clone, Copy)]
@@ -794,7 +832,8 @@ struct PeopleState {
     win_count: Vec<u32>,
     win_pos: Vec<u32>,
     active: Vec<u32>,
-    scratch: GroupScratch,
+    scratch: GroupScratch<u32>,
+    scratch_wide: GroupScratch<i64>,
     user_rows: Vec<UserRow>,
     campaign_daily: CampaignCounters,
     session_number: u64,
@@ -821,33 +860,42 @@ fn flush(person: Key, acc: &mut Option<DayAccumulator>, rows: &mut Vec<UserRow>,
 }
 
 /// One person: their events sorted by ts, their clicks sorted by (ts, click_id).
-fn person_sessions(person: Key, events: &[SessionEvent], clicks: &[SessionClick], state: &mut PeopleState, category_names: &[Vec<u8>]) {
+fn person_sessions<T: TsOffset>(person: Key, ts_rel: &[T], purchases: &[Purchase<T>], window_start: i64, clicks: &[SessionClick], state: &mut PeopleState, category_names: &[Vec<u8>]) {
     let mut day_acc: Option<DayAccumulator> = None;
     let mut first = 0;
     let (mut low, mut high) = (0usize, 0usize);
-    while first < events.len() {
+    let mut next_purchase = 0usize;
+    while first < ts_rel.len() {
         // Events step 5: a gap OVER 30 min starts a new session (equal ts: gap 0).
         let mut last = first + 1;
-        while last < events.len() && events[last].ts - events[last - 1].ts <= SESSION_GAP_MS {
+        while last < ts_rel.len() && ts_rel[last].rel() - ts_rel[last - 1].rel() <= SESSION_GAP_MS {
             last += 1;
         }
-        let session = &events[first..last];
+        let start = window_start + ts_rel[first].rel();
+        let session_len = last - first;
+        let end_ts = ts_rel[last - 1];
         first = last;
         state.session_number += 1;
 
-        let start = session[0].ts;
         let day = start.div_euclid(DAY_MS) as i32; // step 6: UTC date of the start
-        let revenue: u64 = session.iter().map(|event| u64::from(event.price)).sum();
-        let purchased = session.iter().any(|event| event.price > 0);
+        // The session's purchases: every purchase is an event, so each one's ts lies inside
+        // exactly one session's [first ts, last ts] range; take them in ts order.
+        let purchase_first = next_purchase;
+        while next_purchase < purchases.len() && purchases[next_purchase].ts <= end_ts {
+            next_purchase += 1;
+        }
+        let session_purchases = &purchases[purchase_first..next_purchase];
+        let revenue: u64 = session_purchases.iter().map(|purchase| u64::from(purchase.price)).sum();
+        let purchased = !session_purchases.is_empty();
 
         if day_acc.as_ref().is_some_and(|acc| acc.day != day) {
             flush(person, &mut day_acc, &mut state.user_rows, category_names);
         }
         let acc = day_acc.get_or_insert_with(|| DayAccumulator { day, sessions: 0, events: 0, revenue: 0, by_category: Vec::new() });
         acc.sessions += 1;
-        acc.events += session.len() as u64;
+        acc.events += session_len as u64;
         acc.revenue += revenue;
-        for event in session.iter().filter(|event| event.price > 0) {
+        for event in session_purchases {
             match acc.by_category.iter_mut().find(|(c, _)| *c == event.category) {
                 Some(entry) => entry.1 += u64::from(event.price),
                 None => acc.by_category.push((event.category, u64::from(event.price))),
@@ -913,19 +961,20 @@ fn person_sessions(person: Key, events: &[SessionEvent], clicks: &[SessionClick]
 /// `person_sessions`. Clicks of a person with no surviving events can credit nothing.
 /// Reads the per-thread pieces in place; all temporary vectors live in `state.scratch`
 /// and are reused across partitions.
-fn people_partition(
+fn people_partition<T: TsOffset>(
     event_pieces: Vec<&[Event]>,
     click_pieces: Vec<&[Click]>,
     longs: &LongIds,
     state: &mut PeopleState,
     category_names: &[Vec<u8>],
+    window_start: i64,
 ) {
     let total: usize = event_pieces.iter().map(|piece| piece.len()).sum();
     if total == 0 {
         return;
     }
-    let mut scratch = std::mem::take(&mut state.scratch);
-    let GroupScratch { table, group_keys, event_group, event_start, cursor, grouped, click_group, click_start, grouped_clicks } =
+    let mut scratch = std::mem::take(T::scratch(state));
+    let GroupScratch { table, group_keys, event_group, event_start, cursor, click_group, click_start, grouped_clicks, grouped_ts, purchase_start, grouped_purchases } =
         &mut scratch;
     // person -> group number, open addressing over group numbers (u32::MAX = empty).
     let slots = (total * 2).next_power_of_two().max(16);
@@ -965,18 +1014,40 @@ fn people_partition(
     for g in 0..groups {
         event_start[g + 1] += event_start[g];
     }
+    // Timestamps as u32 offsets (4 B per event); purchases (~3%) in their own list.
     cursor.clear();
     cursor.extend_from_slice(event_start);
-    grouped.clear();
-    grouped.reserve(total);
-    let spare = grouped.spare_capacity_mut();
+    purchase_start.clear();
+    purchase_start.resize(groups + 1, 0);
+    grouped_ts.clear();
+    grouped_ts.reserve(total);
+    let spare = grouped_ts.spare_capacity_mut();
     for (event, &group) in event_pieces.iter().copied().flatten().zip(event_group.iter()) {
         let at = &mut cursor[group as usize];
-        spare[*at as usize].write(SessionEvent { ts: event.ts, price: event.price, category: event.category });
+        spare[*at as usize].write(T::from_rel(event.ts - window_start));
         *at += 1;
+        purchase_start[group as usize + 1] += u32::from(event.price > 0);
     }
     // SAFETY: the counting sort wrote every slot in 0..total exactly once.
-    unsafe { grouped.set_len(total) };
+    unsafe { grouped_ts.set_len(total) };
+    for g in 0..groups {
+        purchase_start[g + 1] += purchase_start[g];
+    }
+    let purchase_total = purchase_start[groups] as usize;
+    cursor.clear();
+    cursor.extend_from_slice(purchase_start);
+    grouped_purchases.clear();
+    grouped_purchases.reserve(purchase_total);
+    let spare = grouped_purchases.spare_capacity_mut();
+    for (event, &group) in event_pieces.iter().copied().flatten().zip(event_group.iter()) {
+        if event.price > 0 {
+            let at = &mut cursor[group as usize];
+            spare[*at as usize].write(Purchase { ts: T::from_rel(event.ts - window_start), price: event.price, category: event.category });
+            *at += 1;
+        }
+    }
+    // SAFETY: as above, for the purchases.
+    unsafe { grouped_purchases.set_len(purchase_total) };
     click_group.clear();
     click_start.clear();
     click_start.resize(groups + 1, 0);
@@ -1006,24 +1077,35 @@ fn people_partition(
     // SAFETY: the counting sort wrote every slot in 0..kept_clicks exactly once.
     unsafe { grouped_clicks.set_len(kept_clicks) };
     for g in 0..groups {
-        let person_events = &mut grouped[event_start[g] as usize..event_start[g + 1] as usize];
-        person_events.sort_unstable_by_key(|event| event.ts);
+        let person_ts = &mut grouped_ts[event_start[g] as usize..event_start[g + 1] as usize];
+        person_ts.sort_unstable();
+        let person_purchases = &mut grouped_purchases[purchase_start[g] as usize..purchase_start[g + 1] as usize];
+        if person_purchases.len() > 1 {
+            person_purchases.sort_unstable_by_key(|purchase| purchase.ts);
+        }
         let person_clicks = &mut grouped_clicks[click_start[g] as usize..click_start[g + 1] as usize];
-        person_clicks.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| key::cmp(a.click_id, b.click_id, longs)));
-        person_sessions(group_keys[g], person_events, person_clicks, state, category_names);
+        if person_clicks.iter().all(|click| !key::is_long(click.click_id)) {
+            // No long click_id: key order is byte-wise order, so sort on (ts, key) directly.
+            person_clicks.sort_unstable_by_key(|click| (click.ts, click.click_id));
+        } else {
+            person_clicks.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| key::cmp(a.click_id, b.click_id, longs)));
+        }
+        person_sessions(group_keys[g], person_ts, person_purchases, window_start, person_clicks, state, category_names);
     }
-    state.scratch = scratch;
+    *T::scratch(state) = scratch;
 }
 
 /// Temporary vectors of `people_partition`, kept per thread and reused.
 #[derive(Default)]
-struct GroupScratch {
+struct GroupScratch<T> {
     table: Vec<u32>,
     group_keys: Vec<Key>,
     event_group: Vec<u32>,
     event_start: Vec<u32>,
     cursor: Vec<u32>,
-    grouped: Vec<SessionEvent>,
+    grouped_ts: Vec<T>,
+    purchase_start: Vec<u32>,
+    grouped_purchases: Vec<Purchase<T>>,
     click_group: Vec<u32>,
     click_start: Vec<u32>,
     grouped_clicks: Vec<SessionClick>,
@@ -1148,6 +1230,7 @@ fn run() -> Result<()> {
         person_parts,
         || PeopleState {
             scratch: GroupScratch::default(),
+            scratch_wide: GroupScratch::default(),
             user_rows: Vec::new(),
             campaign_daily: CampaignCounters::new(campaign_count, context.window),
             session_number: 0,
@@ -1159,7 +1242,12 @@ fn run() -> Result<()> {
             let q = order[at];
             let event_pieces: Vec<&[Event]> = person_events.iter().flat_map(|scatter| scatter.pieces(q)).filter(|s| !s.is_empty()).collect();
             let click_pieces: Vec<&[Click]> = click_parts.iter().flat_map(|scatter| scatter.pieces(q)).filter(|s| !s.is_empty()).collect();
-            people_partition(event_pieces, click_pieces, &context.longs, state, &category_names);
+            // Every event ts lies in [window_start, window_end): u32 offsets fit when the window does.
+            if context.window.1 - context.window.0 <= i64::from(u32::MAX) {
+                people_partition::<u32>(event_pieces, click_pieces, &context.longs, state, &category_names, context.window.0);
+            } else {
+                people_partition::<i64>(event_pieces, click_pieces, &context.longs, state, &category_names, context.window.0);
+            }
         },
     );
     timer.mark("sessions + attribution");

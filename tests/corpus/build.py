@@ -215,6 +215,17 @@ case("ts_window_not_at_midnight",
      users=[("u2", "2026-10-01", 1, 1, 0, ""), ("u3", "2026-10-15", 1, 1, 0, "")],
      campaigns=[ORG("2026-10-01", 1), ORG("2026-10-15", 1)])
 
+case("ts_window_longer_than_2_pow_32_ms",
+     "A 75-day window: events 55-70 days after window_start are more than 2^32 ms (~49.7 days) in, "
+     "so the session code must not store them as 32-bit offsets. u1's two views on Dec 10 are one session "
+     "credited to a click on Dec 9; u2 buys p1 for 300 on Nov 25 (organic)",
+     window=("2026-10-01T00:00:00Z", "2026-12-15T00:00:00Z"),
+     events=[ev("e1", "u1", "2026-12-10T10:00:00Z"), ev("e2", "u1", "2026-12-10T10:20:00Z"),
+             ev("e3", "u2", "2026-11-25T12:00:00Z", kind="purchase", product="p1", price="300")],
+     clicks=[ck("k1", "u1", "c_1", "2026-12-09T10:00:00Z")],
+     users=[("u1", "2026-12-10", 1, 2, 0, ""), ("u2", "2026-11-25", 1, 1, 300, "shoes")],
+     campaigns=[("c_1", "search", "2026-12-10", 1, 0, 0, 1), ORG("2026-11-25", 1, 1, 300)])
+
 # ============================================================== events: dedup, validation, lateness
 
 case("dedup_earliest_copy_invalid_type_kills_event",

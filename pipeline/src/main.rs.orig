@@ -791,10 +791,12 @@ impl CampaignCounters {
 }
 
 struct PeopleState {
+    win_count: Vec<u32>,
+    win_pos: Vec<u32>,
+    active: Vec<u32>,
     scratch: GroupScratch,
     user_rows: Vec<UserRow>,
     campaign_daily: CampaignCounters,
-    assist_stamp: Vec<u64>,
     session_number: u64,
 }
 
@@ -822,6 +824,7 @@ fn flush(person: Key, acc: &mut Option<DayAccumulator>, rows: &mut Vec<UserRow>,
 fn person_sessions(person: Key, events: &[SessionEvent], clicks: &[SessionClick], state: &mut PeopleState, category_names: &[Vec<u8>]) {
     let mut day_acc: Option<DayAccumulator> = None;
     let mut first = 0;
+    let (mut low, mut high) = (0usize, 0usize);
     while first < events.len() {
         // Events step 5: a gap OVER 30 min starts a new session (equal ts: gap 0).
         let mut last = first + 1;
@@ -851,20 +854,42 @@ fn person_sessions(person: Key, events: &[SessionEvent], clicks: &[SessionClick]
             }
         }
 
-        // Clicks step 4: qualifying clicks: start - 7 d <= ts <= start. The latest wins; on a
-        // tie the byte-wise smallest click_id (clicks are sorted by (ts, click_id)).
-        let low = clicks.partition_point(|click| click.ts < start - CLICK_REACH_MS);
-        let high = clicks.partition_point(|click| click.ts <= start);
-        let credited = if high > low {
-            let latest = clicks[high - 1].ts;
-            let first_latest = low + clicks[low..high].partition_point(|click| click.ts < latest);
-            // Clicks step 7: every campaign among the same clicks assists once.
-            for click in &clicks[low..high] {
-                let stamp = &mut state.assist_stamp[click.campaign as usize];
-                if *stamp != state.session_number {
-                    *stamp = state.session_number;
-                    state.campaign_daily.at(click.campaign, day).assisted += 1;
+        // Clicks step 4: qualifying clicks: start - 7 d <= ts <= start. Session starts only
+        // increase, so the window [low, high) slides; the distinct campaigns inside it are kept
+        // incrementally (count per campaign + active list) for step 7.
+        while high < clicks.len() && clicks[high].ts <= start {
+            let c = clicks[high].campaign as usize;
+            if state.win_count[c] == 0 {
+                state.win_pos[c] = state.active.len() as u32;
+                state.active.push(clicks[high].campaign);
+            }
+            state.win_count[c] += 1;
+            high += 1;
+        }
+        while low < high && clicks[low].ts < start - CLICK_REACH_MS {
+            let c = clicks[low].campaign as usize;
+            state.win_count[c] -= 1;
+            if state.win_count[c] == 0 {
+                let at = state.win_pos[c] as usize;
+                let last = state.active.pop().expect("active campaign");
+                if at < state.active.len() {
+                    state.active[at] = last;
+                    state.win_pos[last as usize] = at as u32;
                 }
+            }
+            low += 1;
+        }
+        let credited = if high > low {
+            // The latest wins; on a tie the byte-wise smallest click_id (clicks are sorted by
+            // (ts, click_id)): the first of the clicks sharing the latest ts.
+            let latest = clicks[high - 1].ts;
+            let mut first_latest = high - 1;
+            while first_latest > low && clicks[first_latest - 1].ts == latest {
+                first_latest -= 1;
+            }
+            // Clicks step 7: every campaign among the same clicks assists once.
+            for &campaign in &state.active {
+                state.campaign_daily.at(campaign, day).assisted += 1;
             }
             clicks[first_latest].campaign
         } else {
@@ -876,6 +901,11 @@ fn person_sessions(person: Key, events: &[SessionEvent], clicks: &[SessionClick]
         row.revenue += revenue;
     }
     flush(person, &mut day_acc, &mut state.user_rows, category_names);
+    // Reset the window for the next person.
+    for &campaign in &state.active {
+        state.win_count[campaign as usize] = 0;
+    }
+    state.active.clear();
 }
 
 /// Groups one person partition by person (hash + counting sort, no full sort), then runs
@@ -1120,8 +1150,10 @@ fn run() -> Result<()> {
             scratch: GroupScratch::default(),
             user_rows: Vec::new(),
             campaign_daily: CampaignCounters::new(campaign_count, context.window),
-            assist_stamp: vec![u64::MAX; campaign_count],
             session_number: 0,
+            win_count: vec![0; campaign_count],
+            win_pos: vec![0; campaign_count],
+            active: Vec::new(),
         },
         |state, at| {
             let q = order[at];
