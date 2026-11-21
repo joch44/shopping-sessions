@@ -11,9 +11,9 @@ CORPUS   := tests/corpus/cases
 TINY_N   ?= 40
 FUZZ_N   ?= 60
 
-.PHONY: check deep corpus fixtures corpus-cases dev tiny fuzz medium
+.PHONY: check deep corpus fixtures corpus-cases dev tiny fuzz medium parsegate
 
-check: fixtures corpus dev tiny fuzz
+check: fixtures corpus dev tiny fuzz parsegate
 	@echo "== QUICK GATE PASSED"
 
 corpus-cases:
@@ -52,6 +52,11 @@ fuzz:
 	  else \
 	    $(PY) tests/fuzz.py run $$(ls -d data/tiny-s5-e*) $(FUZZ_N) -- $(IMPL) -- env NCPU=2 BUCKETS=4 $(REF) | tail -1; \
 	  fi | tee /dev/stderr | grep -qE '^([0-9]+)/\1 '
+
+# Parse gate (from the research session): live csv/key/ts fast paths vs a frozen v1
+# reference, field for field, on real datasets at many chunkings and synthetic edge files.
+parsegate: corpus-cases
+	@echo "== parse gate"; tools/datasets.sh tiny >/dev/null; research/gate/run_gate.sh pipeline | tail -1 | tee /dev/stderr | grep -q '^PARSE GATE OK'
 
 # Deep gate: medium datasets vs reference, long fuzz. Run in the background on the analysis VM.
 deep: check
