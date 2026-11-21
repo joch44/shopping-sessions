@@ -479,7 +479,7 @@ pub struct CampaignCounts {
 }
 
 struct PeopleState {
-    group_table: Vec<u32>,
+    scratch: GroupScratch,
     user_rows: Vec<UserRow>,
     campaign_daily: FxHashMap<(u32, i32), CampaignCounts>,
     assist_stamp: Vec<u64>,
@@ -569,17 +569,28 @@ fn person_sessions(person: Key, events: &[Event], clicks: &[Click], state: &mut 
 /// Groups one person partition by person (hash + counting sort, no full sort), then runs
 /// each person's events (sorted by ts) and clicks (sorted by ts, click_id) through
 /// `person_sessions`. Clicks of a person with no surviving events can credit nothing.
-fn people_partition(events: Vec<Event>, clicks: Vec<Click>, longs: &LongIds, state: &mut PeopleState, category_names: &[Vec<u8>]) {
-    if events.is_empty() {
+/// Reads the per-thread pieces in place; all temporary vectors live in `state.scratch`
+/// and are reused across partitions.
+fn people_partition(
+    event_pieces: Vec<Vec<Event>>,
+    click_pieces: Vec<Vec<Click>>,
+    longs: &LongIds,
+    state: &mut PeopleState,
+    category_names: &[Vec<u8>],
+) {
+    let total: usize = event_pieces.iter().map(Vec::len).sum();
+    if total == 0 {
         return;
     }
+    let mut scratch = std::mem::take(&mut state.scratch);
+    let GroupScratch { table, group_keys, event_group, event_start, cursor, grouped, click_group, click_start, grouped_clicks } =
+        &mut scratch;
     // person -> group number, open addressing over group numbers (u32::MAX = empty).
-    let slots = (events.len() * 2).next_power_of_two().max(16);
+    let slots = (total * 2).next_power_of_two().max(16);
     let mask = slots - 1;
-    let table = &mut state.group_table;
     table.clear();
     table.resize(slots, u32::MAX);
-    let mut group_keys: Vec<Key> = Vec::new();
+    group_keys.clear();
     let find = |table: &[u32], group_keys: &[Key], person: Key| -> (usize, Option<u32>) {
         let mut slot = (mix(person) >> 24) as usize & mask;
         loop {
@@ -590,9 +601,9 @@ fn people_partition(events: Vec<Event>, clicks: Vec<Click>, longs: &LongIds, sta
             }
         }
     };
-    let mut event_group: Vec<u32> = Vec::with_capacity(events.len());
-    for event in &events {
-        let group = match find(table, &group_keys, event.person) {
+    event_group.clear();
+    for event in event_pieces.iter().flatten() {
+        let group = match find(table, group_keys, event.person) {
             (_, Some(group)) => group,
             (slot, None) => {
                 table[slot] = group_keys.len() as u32;
@@ -604,27 +615,31 @@ fn people_partition(events: Vec<Event>, clicks: Vec<Click>, longs: &LongIds, sta
     }
     let groups = group_keys.len();
     // Counting sort of events, then of clicks, into group order.
-    let mut event_start = vec![0u32; groups + 1];
-    for &group in &event_group {
+    event_start.clear();
+    event_start.resize(groups + 1, 0);
+    for &group in event_group.iter() {
         event_start[group as usize + 1] += 1;
     }
     for g in 0..groups {
         event_start[g + 1] += event_start[g];
     }
-    let mut cursor = event_start.clone();
-    let mut grouped: Vec<Event> = Vec::with_capacity(events.len());
+    cursor.clear();
+    cursor.extend_from_slice(event_start);
+    grouped.clear();
+    grouped.reserve(total);
     let spare = grouped.spare_capacity_mut();
-    for (event, &group) in events.iter().zip(&event_group) {
+    for (event, &group) in event_pieces.iter().flatten().zip(event_group.iter()) {
         let at = &mut cursor[group as usize];
         spare[*at as usize].write(*event);
         *at += 1;
     }
-    // SAFETY: the counting sort wrote every slot in 0..events.len() exactly once.
-    unsafe { grouped.set_len(events.len()) };
-    let mut click_group: Vec<u32> = Vec::with_capacity(clicks.len());
-    let mut click_start = vec![0u32; groups + 1];
-    for click in &clicks {
-        let group = find(table, &group_keys, click.person).1.unwrap_or(u32::MAX);
+    // SAFETY: the counting sort wrote every slot in 0..total exactly once.
+    unsafe { grouped.set_len(total) };
+    click_group.clear();
+    click_start.clear();
+    click_start.resize(groups + 1, 0);
+    for click in click_pieces.iter().flatten() {
+        let group = find(table, group_keys, click.person).1.unwrap_or(u32::MAX);
         click_group.push(group);
         if group != u32::MAX {
             click_start[group as usize + 1] += 1;
@@ -634,10 +649,12 @@ fn people_partition(events: Vec<Event>, clicks: Vec<Click>, longs: &LongIds, sta
         click_start[g + 1] += click_start[g];
     }
     let kept_clicks = click_start[groups] as usize;
-    let mut cursor = click_start.clone();
-    let mut grouped_clicks: Vec<Click> = Vec::with_capacity(kept_clicks);
+    cursor.clear();
+    cursor.extend_from_slice(click_start);
+    grouped_clicks.clear();
+    grouped_clicks.reserve(kept_clicks);
     let spare = grouped_clicks.spare_capacity_mut();
-    for (click, &group) in clicks.iter().zip(&click_group) {
+    for (click, &group) in click_pieces.iter().flatten().zip(click_group.iter()) {
         if group != u32::MAX {
             let at = &mut cursor[group as usize];
             spare[*at as usize].write(*click);
@@ -653,18 +670,24 @@ fn people_partition(events: Vec<Event>, clicks: Vec<Click>, longs: &LongIds, sta
         person_clicks.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| key::cmp(a.click_id, b.click_id, longs)));
         person_sessions(group_keys[g], person_events, person_clicks, state, category_names);
     }
+    state.scratch = scratch;
+}
+
+/// Temporary vectors of `people_partition`, kept per thread and reused.
+#[derive(Default)]
+struct GroupScratch {
+    table: Vec<u32>,
+    group_keys: Vec<Key>,
+    event_group: Vec<u32>,
+    event_start: Vec<u32>,
+    cursor: Vec<u32>,
+    grouped: Vec<Event>,
+    click_group: Vec<u32>,
+    click_start: Vec<u32>,
+    grouped_clicks: Vec<Click>,
 }
 
 // ---------------------------------------------------------------- main
-
-fn take_all<T>(parts: &Mutex<Vec<Vec<T>>>) -> Vec<T> {
-    let parts = std::mem::take(&mut *parts.lock().unwrap());
-    let mut all = Vec::with_capacity(parts.iter().map(Vec::len).sum());
-    for mut part in parts {
-        all.append(&mut part);
-    }
-    all
-}
 
 /// [thread][partition] -> [partition] of [thread] pieces, moving the vectors.
 fn transpose<T>(per_thread: Vec<Vec<Vec<T>>>, partitions: usize) -> Vec<Mutex<Vec<Vec<T>>>> {
@@ -778,7 +801,7 @@ fn run() -> Result<()> {
         threads,
         PERSON_PARTITIONS,
         || PeopleState {
-            group_table: Vec::new(),
+            scratch: GroupScratch::default(),
             user_rows: Vec::new(),
             campaign_daily: FxHashMap::default(),
             assist_stamp: vec![u64::MAX; campaign_count],
@@ -786,7 +809,9 @@ fn run() -> Result<()> {
         },
         |state, at| {
             let q = order[at];
-            people_partition(take_all(&person_events[q]), take_all(&click_parts[q]), &context.longs, state, &category_names);
+            let event_pieces = std::mem::take(&mut *person_events[q].lock().unwrap());
+            let click_pieces = std::mem::take(&mut *click_parts[q].lock().unwrap());
+            people_partition(event_pieces, click_pieces, &context.longs, state, &category_names);
         },
     );
     timer.mark("sessions + attribution");
