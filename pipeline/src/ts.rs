@@ -10,10 +10,6 @@ use crate::csv::ascii_digits;
 
 pub const DAY_MS: i64 = 86_400_000;
 
-fn two(bytes: &[u8]) -> i64 {
-    i64::from(bytes[0] - b'0') * 10 + i64::from(bytes[1] - b'0')
-}
-
 fn is_leap(year: i64) -> bool {
     year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
@@ -60,17 +56,35 @@ pub fn parse(value: &[u8]) -> Option<i64> {
 /// `parse` with a caller-owned date cache.
 #[inline]
 pub fn parse_cached(value: &[u8], dates: &mut DateCache) -> Option<i64> {
+    let n = value.len();
+    if n == 0 {
+        return None;
+    }
+    // F3 first, so an all-digit value of F1's length (20) is still a number.
+    if n <= 18 {
+        // At most 18 digits cannot overflow i64: one branch-free pass.
+        let mut result: i64 = 0;
+        let mut digits = true;
+        for &byte in value {
+            let d = byte.wrapping_sub(b'0');
+            digits &= d < 10;
+            result = result * 10 + i64::from(d);
+        }
+        // Not all digits and shorter than F1/F2: not a timestamp.
+        return digits.then_some(result);
+    }
     if ascii_digits(value) {
         let mut result: i64 = 0;
         for &byte in value {
             result = match result.checked_mul(10).and_then(|r| r.checked_add(i64::from(byte - b'0'))) {
                 Some(r) => r,
-                None => return Some(i64::MAX),
+                None => return Some(i64::MAX), // a valid number, far outside any window
             };
         }
         return Some(result);
     }
-    let offset_ms = match value.len() {
+    let digit = |i: usize| value[i].wrapping_sub(b'0');
+    let offset_ms = match n {
         20 => {
             if value[19] != b'Z' {
                 return None;
@@ -82,10 +96,11 @@ pub fn parse_cached(value: &[u8], dates: &mut DateCache) -> Option<i64> {
             if (sign != b'+' && sign != b'-') || value[22] != b':' {
                 return None;
             }
-            if !ascii_digits(&value[20..22]) || !ascii_digits(&value[23..25]) {
+            let (h1, h2, m1, m2) = (digit(20), digit(21), digit(23), digit(24));
+            if h1 >= 10 || h2 >= 10 || m1 >= 10 || m2 >= 10 {
                 return None;
             }
-            let (hours, minutes) = (two(&value[20..22]), two(&value[23..25]));
+            let (hours, minutes) = (i64::from(h1 * 10 + h2), i64::from(m1 * 10 + m2));
             if hours > 23 || minutes > 59 {
                 return None;
             }
@@ -97,14 +112,14 @@ pub fn parse_cached(value: &[u8], dates: &mut DateCache) -> Option<i64> {
     if value[4] != b'-' || value[7] != b'-' || value[10] != b'T' || value[13] != b':' || value[16] != b':' {
         return None;
     }
-    for range in [0..4, 5..7, 8..10, 11..13, 14..16, 17..19] {
-        if !ascii_digits(&value[range]) {
-            return None;
-        }
+    const DIGITS: [usize; 14] = [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18];
+    if DIGITS.iter().any(|&i| digit(i) >= 10) {
+        return None;
     }
-    let year = two(&value[0..2]) * 100 + two(&value[2..4]);
-    let (month, day) = (two(&value[5..7]), two(&value[8..10]));
-    let (hour, minute, second) = (two(&value[11..13]), two(&value[14..16]), two(&value[17..19]));
+    let two = |i: usize| i64::from(digit(i) * 10 + digit(i + 1));
+    let year = two(0) * 100 + two(2);
+    let (month, day) = (two(5), two(8));
+    let (hour, minute, second) = (two(11), two(14), two(17));
     if !(1..=12).contains(&month) {
         return None;
     }
@@ -121,6 +136,92 @@ pub fn parse_cached(value: &[u8], dates: &mut DateCache) -> Option<i64> {
 mod tests {
     use super::*;
 
+    fn two(bytes: &[u8]) -> i64 {
+        i64::from(bytes[0] - b'0') * 10 + i64::from(bytes[1] - b'0')
+    }
+
+    /// `parse` with a caller-owned date cache.
+    fn parse_cached_v9(value: &[u8]) -> Option<i64> {
+        if ascii_digits(value) {
+            let mut result: i64 = 0;
+            for &byte in value {
+                result = match result.checked_mul(10).and_then(|r| r.checked_add(i64::from(byte - b'0'))) {
+                    Some(r) => r,
+                    None => return Some(i64::MAX),
+                };
+            }
+            return Some(result);
+        }
+        let offset_ms = match value.len() {
+            20 => {
+                if value[19] != b'Z' {
+                    return None;
+                }
+                0
+            }
+            25 => {
+                let sign = value[19];
+                if (sign != b'+' && sign != b'-') || value[22] != b':' {
+                    return None;
+                }
+                if !ascii_digits(&value[20..22]) || !ascii_digits(&value[23..25]) {
+                    return None;
+                }
+                let (hours, minutes) = (two(&value[20..22]), two(&value[23..25]));
+                if hours > 23 || minutes > 59 {
+                    return None;
+                }
+                let offset = (hours * 60 + minutes) * 60_000;
+                if sign == b'-' { -offset } else { offset }
+            }
+            _ => return None,
+        };
+        if value[4] != b'-' || value[7] != b'-' || value[10] != b'T' || value[13] != b':' || value[16] != b':' {
+            return None;
+        }
+        for range in [0..4, 5..7, 8..10, 11..13, 14..16, 17..19] {
+            if !ascii_digits(&value[range]) {
+                return None;
+            }
+        }
+        let year = two(&value[0..2]) * 100 + two(&value[2..4]);
+        let (month, day) = (two(&value[5..7]), two(&value[8..10]));
+        let (hour, minute, second) = (two(&value[11..13]), two(&value[14..16]), two(&value[17..19]));
+        if !(1..=12).contains(&month) {
+            return None;
+        }
+        const DAYS: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let month_days = if month == 2 && is_leap(year) { 29 } else { DAYS[(month - 1) as usize] };
+        if day < 1 || day > month_days || hour > 23 || minute > 59 || second > 59 {
+            return None;
+        }
+        let local = (days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second) * 1_000;
+        Some(local - offset_ms)
+    }
+
+    #[test]
+    fn matches_previous_parser_on_random_inputs() {
+        // A small xorshift so the test needs no dependency.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || { state ^= state << 13; state ^= state >> 7; state ^= state << 17; state };
+        let seeds: [&[u8]; 6] = [b"2026-10-03T23:58:10Z", b"2026-10-03T19:58:10-04:00", b"1791071890000",
+                                 b"2028-02-29T00:00:00+23:59", b"00000001791071890000", b"9223372036854775807"];
+        let alphabet = b"0123456789-+:TZtz .e";
+        let mut dates = DateCache::default();
+        for _ in 0..300_000 {
+            let mut v = seeds[(next() % 6) as usize].to_vec();
+            for _ in 0..(next() % 4) {
+                let at = (next() as usize) % (v.len() + 1);
+                match next() % 3 {
+                    0 if at < v.len() => v[at] = alphabet[(next() as usize) % alphabet.len()],
+                    1 if at < v.len() => { v.remove(at); }
+                    _ => v.insert(at, alphabet[(next() as usize) % alphabet.len()]),
+                }
+            }
+            assert_eq!(parse_cached(&v, &mut dates), parse_cached_v9(&v), "{}", String::from_utf8_lossy(&v));
+        }
+    }
+
     #[test]
     fn forms() {
         let f1 = parse(b"2026-10-03T23:58:10Z").unwrap();
@@ -130,6 +231,14 @@ mod tests {
         assert_eq!(parse(b"0001791071890000"), Some(f1));
         assert_eq!(parse(b"2026-10-03T23:58:10-00:00"), Some(f1));
         assert_eq!(parse(b"99999999999999999999999"), Some(i64::MAX));
+        assert_eq!(parse(b"00000001791071890000"), Some(f1)); // 20 digits: F3, not F1
+        assert_eq!(parse(b"999999999999999999"), Some(999_999_999_999_999_999)); // 18 digits
+        assert_eq!(parse(b"9223372036854775807"), Some(i64::MAX)); // 19 digits, exact
+        assert_eq!(parse(b"9223372036854775808"), Some(i64::MAX)); // saturates
+        assert_eq!(parse(b"2026-10-03T19:58:10-0a:00"), None);
+        assert_eq!(parse(b"2026-10-03T19:58:10-04:0a"), None);
+        assert_eq!(parse(b"2026-1a-03T19:58:10Z"), None);
+        assert_eq!(parse(b"17910718900x"), None);
         assert!(parse(b"2028-02-29T00:00:00Z").is_some());
         for bad in [
             &b""[..], b"2027-02-29T00:00:00Z", b"2026-10-03T23:58:10z", b"2026-10-03t23:58:10Z",
