@@ -135,6 +135,30 @@ pub fn fallback(why: &str) -> ! {
     }
 }
 
+extern "C" fn on_fault(_sig: i32) {
+    extern "C" {
+        fn write(fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize;
+    }
+    unsafe {
+        let msg = b"[v2b] FALLBACK: fault signal\n";
+        write(2, msg.as_ptr() as *const core::ffi::c_void, msg.len());
+        #[allow(static_mut_refs)]
+        if let Some(e) = EXEC.as_ref() {
+            execve(c"/proc/self/exe".as_ptr(), e.ptrs.as_ptr(), environ);
+            execve(e.argv0.as_ptr(), e.ptrs.as_ptr(), environ);
+        }
+        _exit(3)
+    }
+}
+pub fn fault_fallback_init() {
+    extern "C" {
+        fn signal(sig: i32, handler: usize) -> usize;
+    }
+    for sig in [4, 7, 8, 11] {
+        unsafe { signal(sig, on_fault as *const () as usize) };
+    }
+}
+
 #[cfg_attr(feature = "tl", track_caller)]
 pub fn anon(len: usize) -> *mut u8 {
     if ANON_TINY.load(Ordering::Relaxed) && len <= 4096 && A_BASE.load(Ordering::Relaxed) != 0 {
