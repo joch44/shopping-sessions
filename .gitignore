@@ -12,3 +12,7 @@ pipeline/target/
 tools/dashboard/index.json
 research/gate/src/live/
 research/gate/target/
+
+# Notes stay private: no markdown is tracked except the root README (credits).
+*.md
+!/README.md
