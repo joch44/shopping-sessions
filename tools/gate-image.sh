@@ -7,7 +7,7 @@
 # BASE_IMG (user17, user70, eid14, eiddash, cats at 20M; user17 at 60M if present);
 # organizer fixtures, hand-made corpus, dev answer, 40 tiny seeds, 60 fuzz; the mutation
 # gate MUT_REPEATS times (default 5); /fallback, /fallback-v3, /fallback-v2 run directly
-# on 20M s11. Prints PASS/FAIL per check and exits non-zero on any failure.
+# on 20M s11; 6 out-of-distribution ID kinds on medium-s101 vs the Python reference. Prints PASS/FAIL per check and exits non-zero on any failure.
 set -u
 IMG=${1:?image}; BASE=${2:-kit/n1}; REP=${3:-5}
 O=$HOME/osu; T=${GATE_TMP:-/home/azureuser/.claude/jobs/7ac2f85c/tmp/gate}; mkdir -p "$T"
@@ -30,6 +30,22 @@ for ep in /fallback /fallback-v3 /fallback-v2; do run "$IMG" p20m-s11 o "$ep"; c
 for d in shape/p20m-user17 shape/p20m-user70 shape/p20m-eid14 shape/eiddash shape/p20m-cats; do
   run "$BASE" "$d" a; run "$IMG" "$d" b
   r=$($PY tools/compare.py "$T/a" "$T/b" | tail -1); check "shape $d vs $BASE" "$r" MATCH
+done
+# Out-of-distribution IDs (Master's tools/ood_transform.py) on medium-s101, vs the Python
+# reference; transformed data and reference outputs are cached under $OOD_CACHE.
+OC=${OOD_CACHE:-/home/azureuser/.claude/jobs/7ac2f85c/tmp/ood-cache}; mkdir -p "$OC"
+for k in hex uuid b62 unicode punct sku; do
+  D=$OC/medium-s101-$k
+  if [ ! -f "$D.ref/.done" ]; then
+    rm -rf "${D:?}" "${D:?}.ref" "${D:?}.scr"; mkdir -p "$D.ref" "$D.scr"
+    python3 -I tools/ood_transform.py data/medium-s101 "$D" "$k" >/dev/null
+    DATA_DIR=$D OUTPUT_DIR=$D.ref SCRATCH_DIR=$D.scr NCPU=8 $PY reference/reference.py >/dev/null 2>&1 && touch "$D.ref/.done"
+    rm -rf "${D:?}.scr"
+  fi
+  rm -rf "${T:?}/ood"; mkdir -p "$T/ood"; chmod 777 "$T/ood"
+  docker run --rm --network none --read-only --cpus 8 --memory 24g --user 1000:1000 -e NCPU=8 \
+    -v "$D":/data:ro -v "$T/ood":/output "$IMG" >/dev/null 2>&1
+  r=$($PY tools/compare.py "$T/ood" "$D.ref" | tail -1); check "ood $k (medium-s101) vs reference" "$r" MATCH
 done
 out=$(timeout 3000 make -k fixtures corpus dev tiny fuzz IMPL="$HOME/osu-el/tools/docker-impl.sh" IMG="$IMG" 2>&1)
 echo "$out" | grep -q "Error" && { echo "FAIL make check"; echo "$out" | grep -E "Error|DIFFER|MISMATCH" | head; fail=1; } || echo "PASS make check (fixtures corpus dev tiny fuzz)"
