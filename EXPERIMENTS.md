@@ -62,7 +62,7 @@ Mirror VM: 3.01 s @20M, 8.81 s @60M. All outputs match.
 | v22 | SIMD timestamps (parser session) + ingest_ts fast path (research; relies on the rules' F1 guarantee) | 1.53 | 4.12 | parse events 0.63 -> 0.53 s; research A/B vs v21: 1.65 -> 1.52 / 4.56 -> 4.17 |
 | v23 | links resolved in parallel, still overlapped with event parsing (research) | 1.54 | 4.16 | tie with v22 (research A/B 1.507/1.514); links ~0.08 s of parallel work at 20M |
 | v24 | PGO (communicator session), profile from never-timed datasets via tools/pgo.sh | 1.46 | 3.99 | interleaved vs v23: 1.50 / 4.16 |
-| v25 | PEXT splitter (parser session) + regenerated profile | PENDING | | research A/B on v23: parse events 0.52 -> 0.41 s, wall 1.565 -> 1.414 s |
+| v25 | PEXT splitter (parser session) + regenerated profile | 1.40 | 3.63 | parse events 0.38 s @20M / 1.11 s @60M; research A/B on v23: 1.565 -> 1.414 s |
 
 Calibration: v9 mirror 2.24 s vs grader 1.97 s -> factor 0.878 (tools/to_board.py). Target <1.0 s grader
 ~= 1.1 s mirror. Container start/stop floor ~0.34 s (research): in-process budget ~0.75 s @20M.
@@ -70,6 +70,9 @@ Calibration: v9 mirror 2.24 s vs grader 1.97 s -> factor 0.878 (tools/to_board.p
 Lessons: analysis-VM (Zen 5, 16 cores) gains roughly halve on the mirror (Ice Lake, 4 cores x 2 HT);
 memory-layout changes must be A/B'd on the mirror, interleaved (run-to-run drift is ~2-4%).
 
+Rejected (measured, mirror, interleaved vs v25): mimalloc as the only allocator (20M 1.377 vs 1.365 s,
+60M 3.74 vs 3.70 s) and HugeAlloc >= 16 MiB + mimalloc for small (20M 1.380 vs 1.385 tie, 60M 3.62 vs
+3.56 s); the analysis-VM gain (-5.8%, faster end-of-run frees) does not transfer to Ice Lake.
 Rejected (measured, research, mirror): offsets-based judge (no gain once the PEXT splitter is in);
 links-parallel as a separate stage before parsing (tie at 20M, +0.05 s at 60M; superseded by v23);
 target-cpu=icelake-server (communicator: nothing; the grader is only guaranteed Cascade Lake anyway).
