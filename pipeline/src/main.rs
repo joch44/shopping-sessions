@@ -46,8 +46,35 @@ const PRICE_MAX: u64 = 10_000_000;
 const NEVER: i64 = i64::MAX; // an unparseable ingest_ts never wins dedup and is late
 pub const ORGANIC: u32 = u32::MAX; // campaign index of `organic`
 
-const DEDUP_PARTITIONS: usize = 1024; // by event_id; small enough per partition to stay in L2
-const PERSON_PARTITIONS: usize = 1024; // by person; a partition's events + group table fit L2
+// Partition counts, chosen once at startup from the input size (see `set_partitions`): each
+// partition's working set should fit in L2. Powers of two; read through these masks.
+static DEDUP_PARTITIONS: AtomicUsize = AtomicUsize::new(1024); // by event_id
+static PERSON_PARTITIONS: AtomicUsize = AtomicUsize::new(1024); // by person
+
+/// 1024 partitions up to ~30M events, 4096 above. Mirror, 60M: dedup 0.81 -> 0.69 s with 4096
+/// event_id partitions, sessions 0.71 -> 0.64 s with 4096 person partitions, parse unchanged;
+/// at 20M 4096 is neutral (parse +0.01 s), so the smaller count stays there.
+/// PIPELINE_PARTITIONS (a power of two) overrides it, so tests can exercise any count.
+fn set_partitions(estimated_events: usize) {
+    let forced = std::env::var("PIPELINE_PARTITIONS").ok().and_then(|v| v.parse::<usize>().ok());
+    let count = match forced {
+        Some(n) if n.is_power_of_two() && n <= 8192 => n,
+        _ if estimated_events > 30_000_000 => 4096,
+        _ => 1024,
+    };
+    DEDUP_PARTITIONS.store(count, Ordering::Relaxed);
+    PERSON_PARTITIONS.store(count, Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn dedup_partitions() -> usize {
+    DEDUP_PARTITIONS.load(Ordering::Relaxed)
+}
+
+#[inline(always)]
+fn person_partitions() -> usize {
+    PERSON_PARTITIONS.load(Ordering::Relaxed)
+}
 const CHUNK_BYTES: usize = 16 << 20;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -481,12 +508,12 @@ fn judge(context: &Context, fields: &[Option<&[u8]>; 7], ingest: i64, dates: &mu
 
 #[inline]
 fn dedup_partition(id: Key) -> usize {
-    (mix(id) as usize) & (DEDUP_PARTITIONS - 1)
+    (mix(id) as usize) & (dedup_partitions() - 1)
 }
 
 #[inline]
 fn person_partition(person: Key) -> usize {
-    (mix(person) as usize) & (PERSON_PARTITIONS - 1)
+    (mix(person) as usize) & (person_partitions() - 1)
 }
 
 struct ParseState {
@@ -587,8 +614,8 @@ fn dedup(pieces: Vec<&[EventCopy]>, people: &People, scratch: &mut DedupScratch,
     for copy in pieces.iter().copied().flatten() {
         let h = mix(copy.id);
         let tag = h >> 32;
-        // Within one partition the low hash bits are equal: index the table by middle bits.
-        let mut slot = (h >> 10) as usize & mask;
+        // Within one partition the low (partition) bits are equal: index the table above them.
+        let mut slot = (h >> 20) as usize & mask;
         loop {
             let held = table[slot];
             if held == EMPTY {
@@ -990,17 +1017,19 @@ fn run() -> Result<()> {
     // line, ~47 per click line, 15% slack), so they rarely regrow; a wrong guess only costs speed.
     let total_bytes = |maps: &[Option<Mmap>]| maps.iter().map(|m| bytes_of(m).len()).sum::<usize>();
     let per_buffer = |bytes: usize, line: usize, parts: usize| bytes / line * 115 / 100 / threads / parts;
-    let event_cap = per_buffer(total_bytes(&event_maps), 77, DEDUP_PARTITIONS);
-    let click_cap = per_buffer(total_bytes(&click_maps), 47, PERSON_PARTITIONS);
-    let survivor_cap = per_buffer(total_bytes(&event_maps), 77, PERSON_PARTITIONS);
+    set_partitions(total_bytes(&event_maps) / 77);
+    let (dedup_parts, person_parts) = (dedup_partitions(), person_partitions());
+    let event_cap = per_buffer(total_bytes(&event_maps), 77, dedup_parts);
+    let click_cap = per_buffer(total_bytes(&click_maps), 47, person_parts);
+    let survivor_cap = per_buffer(total_bytes(&event_maps), 77, person_parts);
     let new_events = || ParseState {
-        events: Scatter::new(DEDUP_PARTITIONS, event_cap),
-        clicks: Scatter::new(PERSON_PARTITIONS, 0),
+        events: Scatter::new(dedup_parts, event_cap),
+        clicks: Scatter::new(person_parts, 0),
         dates: ts::DateCache::default(),
     };
     let new_clicks = || ParseState {
-        events: Scatter::new(DEDUP_PARTITIONS, 0),
-        clicks: Scatter::new(PERSON_PARTITIONS, click_cap),
+        events: Scatter::new(dedup_parts, 0),
+        clicks: Scatter::new(person_parts, click_cap),
         dates: ts::DateCache::default(),
     };
     let parsed = run_tasks(threads, event_chunks.len() + 1, new_events, |state, at| {
@@ -1025,8 +1054,8 @@ fn run() -> Result<()> {
     // C. dedup per event_id partition.
     let deduped = run_tasks(
         threads,
-        DEDUP_PARTITIONS,
-        || (DedupScratch::default(), Scatter::new(PERSON_PARTITIONS, survivor_cap)),
+        dedup_parts,
+        || (DedupScratch::default(), Scatter::new(person_parts, survivor_cap)),
         |(scratch, out), p| {
             let pieces: Vec<&[EventCopy]> = event_parts.iter().flat_map(|scatter| scatter.pieces(p)).filter(|s| !s.is_empty()).collect();
             dedup(pieces, &people, scratch, out)
@@ -1036,14 +1065,14 @@ fn run() -> Result<()> {
     timer.mark("dedup");
 
     // D. per person partition, heaviest first.
-    let mut order: Vec<usize> = (0..PERSON_PARTITIONS).collect();
+    let mut order: Vec<usize> = (0..person_parts).collect();
     let weight = |q: usize| person_events.iter().map(|scatter| scatter.len(q)).sum::<usize>();
-    let weights: Vec<usize> = (0..PERSON_PARTITIONS).map(weight).collect();
+    let weights: Vec<usize> = (0..person_parts).map(weight).collect();
     order.sort_by_key(|&q| std::cmp::Reverse(weights[q]));
     let campaign_count = campaign_rows.len();
     let states = run_tasks(
         threads,
-        PERSON_PARTITIONS,
+        person_parts,
         || PeopleState {
             scratch: GroupScratch::default(),
             user_rows: Vec::new(),
