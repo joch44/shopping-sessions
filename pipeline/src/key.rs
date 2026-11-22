@@ -18,6 +18,26 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 pub type Key = u128;
 const LONG: u8 = 0xFF;
+/// A long click_id kept as a reference to its bytes in the mapped click file: the address in
+/// the top 64 bits, the length above this marker byte. Click IDs are only ever ordered (the
+/// tie-break among clicks of one ts), so they need no hash and no copy; `cmp` reads the bytes.
+const REF: u8 = 0xFE;
+
+/// The key of a click_id: a short one packs as usual, a long one becomes a REF to its bytes,
+/// which must stay mapped until the last `cmp`.
+#[inline(always)]
+pub fn click_key(id: &[u8]) -> Key {
+    if id.len() <= 15 {
+        return key_of(id, None);
+    }
+    ((id.as_ptr() as usize as u128) << 64) | ((id.len() as u128) << 8) | Key::from(REF)
+}
+
+/// Whether ordering this key needs its bytes (a long or REF key).
+#[inline(always)]
+pub fn needs_bytes(key: Key) -> bool {
+    key as u8 >= REF
+}
 
 pub fn is_long(key: Key) -> bool {
     key as u8 == LONG
@@ -307,14 +327,22 @@ pub fn key_of_deferred_once(id: &[u8], longs: &LongIds) -> Key {
 
 /// Byte-wise order of the IDs behind two keys.
 pub fn cmp(a: Key, b: Key, longs: &LongIds) -> Ordering {
-    if !is_long(a) && !is_long(b) {
+    if !needs_bytes(a) && !needs_bytes(b) {
         a.cmp(&b)
     } else {
-        // No allocation: a short key's bytes come from the key itself, a long one's from the table.
+        // No allocation: a short key's bytes come from the key itself, a long one's from the
+        // table, a REF's from the mapped file.
         let (sa, sb) = (a.to_be_bytes(), b.to_be_bytes());
-        let x: &[u8] = if is_long(a) { longs.slice(a) } else { &sa[..sa[15] as usize] };
-        let y: &[u8] = if is_long(b) { longs.slice(b) } else { &sb[..sb[15] as usize] };
-        x.cmp(y)
+        fn bytes<'a>(k: Key, s: &'a [u8; 16], longs: &'a LongIds) -> &'a [u8] {
+            match k as u8 {
+                LONG => longs.slice(k),
+                // SAFETY: a REF is made by click_key from bytes of a click file mapping that the
+                // pipeline keeps alive until sessions (every cmp) are done.
+                REF => unsafe { std::slice::from_raw_parts((k >> 64) as usize as *const u8, ((k >> 8) as u64 & 0xFFFF_FFFF_FFFF) as usize) },
+                _ => &s[..s[15] as usize],
+            }
+        }
+        bytes(a, &sa, longs).cmp(bytes(b, &sb, longs))
     }
 }
 

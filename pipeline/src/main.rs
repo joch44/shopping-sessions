@@ -35,7 +35,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::csv::{ascii_digits, data_lines, for_each_record, parse_line};
 use crate::compact::EventCopy32;
-use crate::key::{Key, LongIds, key_of, key_of_deferred, key_of_deferred_once, mix};
+use crate::key::{Key, LongIds, key_of, key_of_deferred, mix};
 use crate::people::People;
 use crate::blocks::BlockScatter;
 use crate::scatter::Scatter;
@@ -745,7 +745,7 @@ fn parse_chunk(
                 if ts < start_ms || ts >= end_ms {
                     return;
                 }
-                state.early_clicks.push(Click { person: key_of(user, None), click_id: key_of_deferred_once(click_id, &context.longs), ts, campaign });
+                state.early_clicks.push(Click { person: key_of(user, None), click_id: key::click_key(click_id), ts, campaign });
             });
         }
         Kind::Click => {
@@ -767,7 +767,7 @@ fn parse_chunk(
                 // output row), so long click user IDs are hashed only, not recorded.
                 let user = key_of(user, None);
                 people.prefetch(user);
-                pending.push((user, Click { person: 0, click_id: key_of_deferred_once(click_id, &context.longs), ts, campaign }));
+                pending.push((user, Click { person: 0, click_id: key::click_key(click_id), ts, campaign }));
                 if pending.len() == CLICK_BATCH {
                     flush_clicks(people, &mut pending, &mut state.clicks);
                 }
@@ -1463,7 +1463,7 @@ fn people_partition<T: TsOffset>(
             person_purchases.sort_unstable_by_key(|purchase| purchase.ts);
         }
         let person_clicks = &mut grouped_clicks[click_start[g] as usize..click_start[g + 1] as usize];
-        if person_clicks.iter().all(|click| !key::is_long(click.click_id)) {
+        if person_clicks.iter().all(|click| !key::needs_bytes(click.click_id)) {
             // No long click_id: key order is byte-wise order, so sort on (ts, key) directly.
             person_clicks.sort_unstable_by_key(|click| (click.ts, click.click_id));
         } else {
@@ -1658,10 +1658,13 @@ fn run() -> Result<()> {
     };
     // On the 64-byte path sessions read each unnamed person's ID from its event line, so the
     // event files stay mapped until then.
+    // Long click_ids are references into the click files (key::click_key): those stay mapped
+    // until sessions are done too.
     let mut event_maps = Some(event_maps);
+    let mut click_maps = Some(click_maps);
     if unmap_inputs {
         let events = if context.name_from_lines { None } else { event_maps.take() };
-        let maps = (events, click_maps, link_maps);
+        let maps = (events, link_maps);
         std::thread::spawn(move || drop(maps));
     }
     let event_maps_ref: &[Option<Mmap>] = event_maps.as_deref().unwrap_or(&[]);
@@ -1750,7 +1753,7 @@ fn run() -> Result<()> {
         return Err(error.into());
     }
     if unmap_inputs {
-        let maps = event_maps.take();
+        let maps = (event_maps.take(), click_maps.take());
         std::thread::spawn(move || drop(maps));
     }
     timer.mark("sessions + attribution");
