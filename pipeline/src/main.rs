@@ -1189,7 +1189,10 @@ fn flush(person: Key, acc: &mut Option<DayAccumulator>, rows: &mut Vec<UserRow>,
 }
 
 /// One person: their events sorted by ts, their clicks sorted by (ts, click_id).
-fn person_sessions<T: TsOffset>(person: Key, ts_rel: &[T], purchases: &[Purchase<T>], window_start: i64, clicks: &[SessionClick], state: &mut PeopleState, category_names: &[Vec<u8>]) {
+/// Clicks sorted by ts only: among clicks sharing the latest ts, the byte-wise smallest
+/// click_id is found here.
+#[allow(clippy::too_many_arguments)]
+fn person_sessions<T: TsOffset>(person: Key, ts_rel: &[T], purchases: &[Purchase<T>], window_start: i64, clicks: &[SessionClick], state: &mut PeopleState, category_names: &[Vec<u8>], longs: &LongIds) {
     let mut day_acc: Option<DayAccumulator> = None;
     let mut first = 0;
     let (mut low, mut high) = (0usize, 0usize);
@@ -1277,7 +1280,13 @@ fn person_sessions<T: TsOffset>(person: Key, ts_rel: &[T], purchases: &[Purchase
                     }
                 }
             }
-            clicks[first_latest].campaign
+            let mut best = first_latest;
+            for at in first_latest + 1..high {
+                if key::cmp(clicks[at].click_id, clicks[best].click_id, longs) == std::cmp::Ordering::Less {
+                    best = at;
+                }
+            }
+            clicks[best].campaign
         } else {
             ORGANIC // step 5
         };
@@ -1317,6 +1326,43 @@ impl Names<'_> {
     }
 }
 
+/// LSD radix sort on a non-negative key, 11 bits per pass (a 2048-entry count table stays in
+/// L1), as many passes as the largest key needs; small inputs use a comparison sort. Equal
+/// keys may end in any order.
+fn radix_sort<K: Copy>(v: &mut Vec<K>, tmp: &mut Vec<K>, counts: &mut Vec<u32>, key: impl Fn(&K) -> u64) {
+    let n = v.len();
+    if n < 96 {
+        v.sort_unstable_by_key(|k| key(k));
+        return;
+    }
+    let max = v.iter().map(&key).max().unwrap_or(0);
+    let bits = 64 - max.leading_zeros();
+    const RADIX: u32 = 11;
+    let passes = bits.div_ceil(RADIX);
+    tmp.clear();
+    tmp.resize(n, v[0]);
+    counts.resize(1 << RADIX, 0);
+    for pass in 0..passes {
+        let shift = pass * RADIX;
+        counts.fill(0);
+        for k in v.iter() {
+            counts[((key(k) >> shift) as usize) & ((1 << RADIX) - 1)] += 1;
+        }
+        let mut sum = 0u32;
+        for c in counts.iter_mut() {
+            let here = *c;
+            *c = sum;
+            sum += here;
+        }
+        for k in v.iter() {
+            let b = ((key(k) >> shift) as usize) & ((1 << RADIX) - 1);
+            tmp[counts[b] as usize] = *k;
+            counts[b] += 1;
+        }
+        std::mem::swap(v, tmp);
+    }
+}
+
 fn people_partition<T: TsOffset>(
     event_pieces: Vec<&[Event]>,
     click_pieces: Vec<&[Click]>,
@@ -1331,8 +1377,10 @@ fn people_partition<T: TsOffset>(
         return;
     }
     let mut scratch = std::mem::take(T::scratch(state));
-    let GroupScratch { table, group_keys, event_start, cursor, click_group, click_start, grouped_clicks, grouped_ts, purchase_start, grouped_purchases, keyed, keyed_purchases } =
-        &mut scratch;
+    let GroupScratch {
+        table, group_keys, event_start, cursor, click_group: _, click_start, grouped_clicks, grouped_ts, purchase_start, grouped_purchases, keyed, keyed_purchases,
+        keyed_clicks, tmp_keyed, tmp_purchases, tmp_clicks, counts,
+    } = &mut scratch;
     // person -> group number, open addressing over group numbers (u32::MAX = empty).
     let slots = (total * 2).next_power_of_two().max(16);
     let mask = slots - 1;
@@ -1384,6 +1432,10 @@ fn people_partition<T: TsOffset>(
         }
     }
     let groups = group_keys.len();
+    // Events and purchases sorted by ts once per partition; the counting sorts by group below
+    // keep that order, so every person's run comes out ts-sorted (no per-person sorts).
+    radix_sort(keyed, tmp_keyed, counts, |&(_, ts)| ts.rel() as u64);
+    radix_sort(keyed_purchases, tmp_purchases, counts, |(_, purchase)| purchase.ts.rel() as u64);
     // Counting sort of events, then of clicks, into group order.
     event_start.clear();
     event_start.resize(groups + 1, 0);
@@ -1427,16 +1479,19 @@ fn people_partition<T: TsOffset>(
     }
     // SAFETY: as above, for the purchases.
     unsafe { grouped_purchases.set_len(purchase_total) };
-    click_group.clear();
+    // Clicks of persons with events, sorted by ts once per partition (parse kept only clicks
+    // with ts >= window_start - 7 d); ties on ts are settled by click_id in person_sessions.
+    keyed_clicks.clear();
     click_start.clear();
     click_start.resize(groups + 1, 0);
     for click in click_pieces.iter().copied().flatten() {
-        let group = find(table, group_keys, click.person).1.unwrap_or(u32::MAX);
-        click_group.push(group);
-        if group != u32::MAX {
+        if let Some(group) = find(table, group_keys, click.person).1 {
+            keyed_clicks.push((group, SessionClick { click_id: click.click_id, ts: click.ts, campaign: click.campaign }));
             click_start[group as usize + 1] += 1;
         }
     }
+    let click_base = window_start - CLICK_REACH_MS;
+    radix_sort(keyed_clicks, tmp_clicks, counts, |(_, click)| (click.ts - click_base) as u64);
     for g in 0..groups {
         click_start[g + 1] += click_start[g];
     }
@@ -1446,30 +1501,18 @@ fn people_partition<T: TsOffset>(
     grouped_clicks.clear();
     grouped_clicks.reserve(kept_clicks);
     let spare = grouped_clicks.spare_capacity_mut();
-    for (click, &group) in click_pieces.iter().copied().flatten().zip(click_group.iter()) {
-        if group != u32::MAX {
-            let at = &mut cursor[group as usize];
-            spare[*at as usize].write(SessionClick { click_id: click.click_id, ts: click.ts, campaign: click.campaign });
-            *at += 1;
-        }
+    for &(group, click) in keyed_clicks.iter() {
+        let at = &mut cursor[group as usize];
+        spare[*at as usize].write(click);
+        *at += 1;
     }
     // SAFETY: the counting sort wrote every slot in 0..kept_clicks exactly once.
     unsafe { grouped_clicks.set_len(kept_clicks) };
     for g in 0..groups {
-        let person_ts = &mut grouped_ts[event_start[g] as usize..event_start[g + 1] as usize];
-        person_ts.sort_unstable();
-        let person_purchases = &mut grouped_purchases[purchase_start[g] as usize..purchase_start[g + 1] as usize];
-        if person_purchases.len() > 1 {
-            person_purchases.sort_unstable_by_key(|purchase| purchase.ts);
-        }
-        let person_clicks = &mut grouped_clicks[click_start[g] as usize..click_start[g + 1] as usize];
-        if person_clicks.iter().all(|click| !key::is_long(click.click_id)) {
-            // No long click_id: key order is byte-wise order, so sort on (ts, key) directly.
-            person_clicks.sort_unstable_by_key(|click| (click.ts, click.click_id));
-        } else {
-            person_clicks.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| key::cmp(a.click_id, b.click_id, longs)));
-        }
-        person_sessions(group_keys[g], person_ts, person_purchases, window_start, person_clicks, state, category_names);
+        let person_ts = &grouped_ts[event_start[g] as usize..event_start[g + 1] as usize];
+        let person_purchases = &grouped_purchases[purchase_start[g] as usize..purchase_start[g + 1] as usize];
+        let person_clicks = &grouped_clicks[click_start[g] as usize..click_start[g + 1] as usize];
+        person_sessions(group_keys[g], person_ts, person_purchases, window_start, person_clicks, state, category_names, longs);
     }
     *T::scratch(state) = scratch;
 }
@@ -1489,6 +1532,11 @@ struct GroupScratch<T> {
     click_group: Vec<u32>,
     click_start: Vec<u32>,
     grouped_clicks: Vec<SessionClick>,
+    keyed_clicks: Vec<(u32, SessionClick)>,
+    tmp_keyed: Vec<(u32, T)>,
+    tmp_purchases: Vec<(u32, Purchase<T>)>,
+    tmp_clicks: Vec<(u32, SessionClick)>,
+    counts: Vec<u32>,
 }
 
 // ---------------------------------------------------------------- main
