@@ -65,7 +65,7 @@ fn set_partitions(estimated_events: usize) {
     let count = match forced {
         Some(n) if n.is_power_of_two() && n <= 8192 => n,
         _ if estimated_events > 30_000_000 => 4096,
-        _ => 1024,
+        _ => 2048,
     };
     DEDUP_PARTITIONS.store(count, Ordering::Relaxed);
     PERSON_PARTITIONS.store(count, Ordering::Relaxed);
