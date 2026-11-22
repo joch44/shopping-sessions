@@ -126,24 +126,33 @@ impl LongIds {
         });
     }
 
-    /// Records a long ID for `build` (no shared state touched per occurrence).
+    /// Records a long ID for `build` (no shared state touched per occurrence). `filter`: skip
+    /// keys in the recent-keys filter (worth it for IDs that repeat, like user IDs; not for
+    /// click IDs, which occur about once each).
     #[inline]
-    fn defer(&self, key: Key, id: &[u8]) {
+    fn defer(&self, key: Key, id: &[u8], filter: bool) {
         DEFER.with(|d| {
             let mut d = d.borrow_mut();
             let me = self as *const Self as usize;
             if d.owner != me {
                 *d = Defer { owner: me, recent: vec![0; 1 << RECENT_BITS], ..Defer::default() };
             }
-            let slot = ((key >> 8) as usize) & ((1 << RECENT_BITS) - 1);
-            if d.recent[slot] == key {
-                return;
+            if filter {
+                let slot = ((key >> 8) as usize) & ((1 << RECENT_BITS) - 1);
+                if d.recent[slot] == key {
+                    return;
+                }
+                d.recent[slot] = key;
             }
-            d.recent[slot] = key;
             let start = d.bytes.len() as u32;
             d.bytes.extend_from_slice(id);
             d.entries.push((key, start, id.len() as u32));
         });
+    }
+
+    /// Records a person's name read in sessions (one per person: no filter).
+    pub fn defer_name(&self, key: Key, id: &[u8]) {
+        self.defer(key, id, false);
     }
 
     /// Ends a work unit: this thread's deferred IDs become one batch (call where `flush` is called).
@@ -215,6 +224,16 @@ impl LongIds {
         self.shards[shard_of(key)].read().unwrap().get(&key).copied().unwrap_or_default()
     }
 
+    /// Appends the ID's bytes to `out` without allocating (output writer).
+    pub fn append_bytes(&self, key: Key, out: &mut Vec<u8>) {
+        if is_long(key) {
+            out.extend_from_slice(self.slice(key));
+        } else {
+            let bytes = key.to_be_bytes();
+            out.extend_from_slice(&bytes[..bytes[15] as usize]);
+        }
+    }
+
     pub fn bytes(&self, key: Key) -> Vec<u8> {
         if !is_long(key) {
             return short_bytes(key);
@@ -271,7 +290,18 @@ pub fn key_of_deferred(id: &[u8], longs: &LongIds) -> Key {
         return key_of(id, None);
     }
     let key = (xxhash_rust::xxh3::xxh3_128(id) << 8) | Key::from(LONG);
-    longs.defer(key, id);
+    longs.defer(key, id, true);
+    key
+}
+
+/// `key_of_deferred` for IDs that occur about once each (click IDs): no recent-keys filter.
+#[inline]
+pub fn key_of_deferred_once(id: &[u8], longs: &LongIds) -> Key {
+    if id.len() <= 15 {
+        return key_of(id, None);
+    }
+    let key = (xxhash_rust::xxh3::xxh3_128(id) << 8) | Key::from(LONG);
+    longs.defer(key, id, false);
     key
 }
 
