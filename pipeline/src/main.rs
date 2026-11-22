@@ -1405,7 +1405,30 @@ fn people_partition<T: TsOffset>(
     keyed_purchases.clear();
     // Built on first need: this partition's unlinked long persons and one line of each.
     let mut lines: Option<FxHashMap<Key, u64>> = None;
-    for event in event_pieces.iter().copied().flatten() {
+    // Survivor blocks are 4 KiB pieces scattered over memory: the hardware prefetcher stops at
+    // each page edge, so the next pieces' first lines are requested while this one is grouped.
+    const PIECES_AHEAD: usize = 2;
+    let prefetch_piece = |piece: &[Event]| {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            let base = piece.as_ptr().cast::<i8>();
+            let bytes = std::mem::size_of_val(piece);
+            let mut at = 0;
+            while at < bytes.min(1024) {
+                _mm_prefetch(base.wrapping_add(at), _MM_HINT_T0);
+                at += 64;
+            }
+        }
+    };
+    for piece in event_pieces.iter().take(PIECES_AHEAD) {
+        prefetch_piece(piece);
+    }
+    for (piece_at, piece) in event_pieces.iter().enumerate() {
+    if let Some(ahead) = event_pieces.get(piece_at + PIECES_AHEAD) {
+        prefetch_piece(ahead);
+    }
+    for event in piece.iter() {
         let group = match find(table, group_keys, event.person) {
             (_, Some(group)) => group,
             (slot, None) => {
@@ -1430,6 +1453,7 @@ fn people_partition<T: TsOffset>(
         if event.price > 0 {
             keyed_purchases.push((group, Purchase { ts: ts_rel, price: event.price, category: event.category }));
         }
+    }
     }
     let groups = group_keys.len();
     // Events and purchases sorted by ts once per partition; the counting sorts by group below
@@ -1484,11 +1508,32 @@ fn people_partition<T: TsOffset>(
     keyed_clicks.clear();
     click_start.clear();
     click_start.resize(groups + 1, 0);
-    for click in click_pieces.iter().copied().flatten() {
+    let prefetch_clicks = |piece: &[Click]| {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            let base = piece.as_ptr().cast::<i8>();
+            let bytes = std::mem::size_of_val(piece);
+            let mut at = 0;
+            while at < bytes.min(1536) {
+                _mm_prefetch(base.wrapping_add(at), _MM_HINT_T0);
+                at += 64;
+            }
+        }
+    };
+    for piece in click_pieces.iter().take(PIECES_AHEAD) {
+        prefetch_clicks(piece);
+    }
+    for (piece_at, piece) in click_pieces.iter().enumerate() {
+    if let Some(ahead) = click_pieces.get(piece_at + PIECES_AHEAD) {
+        prefetch_clicks(ahead);
+    }
+    for click in piece.iter() {
         if let Some(group) = find(table, group_keys, click.person).1 {
             keyed_clicks.push((group, SessionClick { click_id: click.click_id, ts: click.ts, campaign: click.campaign }));
             click_start[group as usize + 1] += 1;
         }
+    }
     }
     let click_base = window_start - CLICK_REACH_MS;
     radix_sort(keyed_clicks, tmp_clicks, counts, |(_, click)| (click.ts - click_base) as u64);
