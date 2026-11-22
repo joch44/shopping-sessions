@@ -31,6 +31,28 @@ for d in shape/p20m-user17 shape/p20m-user70 shape/p20m-eid14 shape/eiddash shap
   run "$BASE" "$d" a; run "$IMG" "$d" b
   r=$($PY tools/compare.py "$T/a" "$T/b" | tail -1); check "shape $d vs $BASE" "$r" MATCH
 done
+# v5 data (rescore 2026-11-22: keyed IDs, 1 in 8 with a 32-char hex suffix): the official
+# dev answer, 5 tiny seeds + a 2M set vs the Python reference (cached), and 20M s11 vs the
+# hashes three independent implementations and reference.py agree on.
+V5G=$O/inputs/v5/gen/generator/target/release/generate; V5C=${V5_CACHE:-/home/azureuser/.claude/jobs/7ac2f85c/tmp/v5-cache}; mkdir -p "$V5C"
+if [ -x "$V5G" ]; then
+  [ -f "$O/data/v5-dev-s1/manifest.json" ] || "$V5G" --seed 1 --events 1000000 --clicks 250000 --output "$O/data/v5-dev-s1" >/dev/null
+  run "$IMG" v5-dev-s1 o; r=$($PY tools/compare.py "$T/o" inputs/v5/ans/dev-answer | tail -1); check "v5 dev vs official answer" "$r" MATCH
+  for sd in "501 12000" "502 31000" "503 47000" "504 5000" "505 22000" "506 2000000"; do
+    set -- $sd; D=$V5C/v5-s$1-e$2
+    if [ ! -f "$D.ref/.done" ]; then
+      rm -rf "${D:?}" "${D:?}.ref" "${D:?}.scr"; mkdir -p "$D.ref" "$D.scr"
+      "$V5G" --seed "$1" --events "$2" --clicks $(( $2 / 4 )) --output "$D" >/dev/null
+      DATA_DIR=$D OUTPUT_DIR=$D.ref SCRATCH_DIR=$D.scr NCPU=8 $PY reference/reference.py >/dev/null 2>&1 && touch "$D.ref/.done"
+      rm -rf "${D:?}.scr"
+    fi
+    rm -rf "${T:?}/v5"; mkdir -p "$T/v5"; chmod 777 "$T/v5"
+    docker run --rm --network none --read-only --cpus 8 --memory 24g --user 1000:1000 -e NCPU=8 \
+      -v "$D":/data:ro -v "$T/v5":/output "$IMG" >/dev/null 2>&1
+    r=$($PY tools/compare.py "$T/v5" "$D.ref" | tail -1); check "v5 seed $1 ($2 events) vs reference" "$r" MATCH
+  done
+  if [ -f "$O/data/v5-p20m-s11/manifest.json" ]; then run "$IMG" v5-p20m-s11 o; check "v5 20M s11 consensus hash" "$(hashes o)" "7f0e9a203830586f,6073e03ca710c319"; fi
+else echo "FAIL v5 generator missing at $V5G"; fail=1; fi
 # Out-of-distribution IDs (Master's tools/ood_transform.py) on medium-s101, vs the Python
 # reference; transformed data and reference outputs are cached under $OOD_CACHE.
 OC=${OOD_CACHE:-/home/azureuser/.claude/jobs/7ac2f85c/tmp/ood-cache}; mkdir -p "$OC"
