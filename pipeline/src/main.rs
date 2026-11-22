@@ -35,7 +35,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::csv::{ascii_digits, data_lines, for_each_record, parse_line};
 use crate::compact::EventCopy32;
-use crate::key::{Key, LongIds, key_of, key_of_deferred, key_of_deferred_once, mix};
+use crate::key::{Key, LongIds, key_of, key_of_deferred, mix};
 use crate::people::People;
 use crate::blocks::BlockScatter;
 use crate::scatter::Scatter;
@@ -593,7 +593,7 @@ struct Context {
 
 
 /// Events steps 3 (validate) and 4 (late) for one copy: Some((user_id bytes, ts, price, category)).
-#[inline]
+#[inline(always)]
 fn judge<'a>(context: &Context, fields: &[Option<&'a [u8]>; 7], ingest: i64, dates: &mut ts::DateCache) -> Option<(&'a [u8], i64, u32, u32)> {
     let [_, user, ts, _, kind, product, price] = *fields;
     let (user, product, kind) = (user?, product?, kind?);
@@ -699,7 +699,7 @@ fn parse_chunk(
             let file_seq = (chunk.file as u64) << 40;
             // Step 1: for_each_record drops malformed lines.
             let window_start = context.window.0;
-            for_each_record::<7>(bytes_of(&event_maps[chunk.file]), chunk.start, chunk.end, |fields, offset| {
+            for_each_record::<7>(bytes_of(&event_maps[chunk.file]), chunk.start, chunk.end, #[inline(always)] |fields, offset| {
                 let Some(event_id) = fields[0] else { return }; // step 1: empty event_id
                 let ingest = fields[3].and_then(|v| ts::parse_ingest(v, &mut state.dates)).unwrap_or(NEVER);
                 if context.compact {
@@ -745,7 +745,7 @@ fn parse_chunk(
                 if ts < start_ms || ts >= end_ms {
                     return;
                 }
-                state.early_clicks.push(Click { person: key_of(user, None), click_id: key_of_deferred_once(click_id, &context.longs), ts, campaign });
+                state.early_clicks.push(Click { person: key_of(user, None), click_id: key::click_key(click_id), ts, campaign });
             });
         }
         Kind::Click => {
@@ -767,7 +767,7 @@ fn parse_chunk(
                 // output row), so long click user IDs are hashed only, not recorded.
                 let user = key_of(user, None);
                 people.prefetch(user);
-                pending.push((user, Click { person: 0, click_id: key_of_deferred_once(click_id, &context.longs), ts, campaign }));
+                pending.push((user, Click { person: 0, click_id: key::click_key(click_id), ts, campaign }));
                 if pending.len() == CLICK_BATCH {
                     flush_clicks(people, &mut pending, &mut state.clicks);
                 }
@@ -1463,7 +1463,7 @@ fn people_partition<T: TsOffset>(
             person_purchases.sort_unstable_by_key(|purchase| purchase.ts);
         }
         let person_clicks = &mut grouped_clicks[click_start[g] as usize..click_start[g + 1] as usize];
-        if person_clicks.iter().all(|click| !key::is_long(click.click_id)) {
+        if person_clicks.iter().all(|click| !key::needs_bytes(click.click_id)) {
             // No long click_id: key order is byte-wise order, so sort on (ts, key) directly.
             person_clicks.sort_unstable_by_key(|click| (click.ts, click.click_id));
         } else {
@@ -1662,10 +1662,13 @@ fn run() -> Result<()> {
     };
     // On the 64-byte path sessions read each unnamed person's ID from its event line, so the
     // event files stay mapped until then.
+    // Long click_ids are references into the click files (key::click_key): those stay mapped
+    // until sessions are done too.
     let mut event_maps = Some(event_maps);
+    let mut click_maps = Some(click_maps);
     if unmap_inputs {
         let events = if context.name_from_lines { None } else { event_maps.take() };
-        let maps = (events, click_maps, link_maps);
+        let maps = (events, link_maps);
         std::thread::spawn(move || drop(maps));
     }
     let event_maps_ref: &[Option<Mmap>] = event_maps.as_deref().unwrap_or(&[]);
@@ -1766,7 +1769,7 @@ fn run() -> Result<()> {
         return Err(error.into());
     }
     if unmap_inputs {
-        let maps = event_maps.take();
+        let maps = (event_maps.take(), click_maps.take());
         std::thread::spawn(move || drop(maps));
     }
     timer.mark("sessions + attribution");

@@ -60,7 +60,7 @@ pub fn parse(value: &[u8]) -> Option<i64> {
 /// 1..=16 digits) take a SIMD path with no length dispatch on the date-time fields; every
 /// other input, and any input that fails a fast-path check, goes to `parse_exact`, so the
 /// result is identical for every input.
-#[inline]
+#[inline(always)]
 pub fn parse_cached(value: &[u8], dates: &mut DateCache) -> Option<i64> {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl"))]
     return parse_simd(value, dates);
@@ -242,7 +242,7 @@ fn parse_simd(v: &[u8], dates: &mut DateCache) -> Option<i64> {
 /// F1"): a 20-byte value ending in `Z` is read at fixed offsets with no validation, its date
 /// through the month cache. Anything else (an empty or odd field in hand-made input, an
 /// all-digit value of F1's length) takes the exact parser.
-#[inline]
+#[inline(always)]
 pub fn parse_ingest(value: &[u8], dates: &mut DateCache) -> Option<i64> {
     if value.len() != 20 || value[19] != b'Z' {
         return parse_cached(value, dates);
