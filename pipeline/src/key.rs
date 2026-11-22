@@ -253,7 +253,7 @@ fn short_bytes(key: Key) -> Vec<u8> {
 }
 
 /// The key of a non-empty ID. `remember` stores a long ID's bytes for later.
-#[inline]
+#[inline(always)]
 pub fn key_of(id: &[u8], longs: Option<&LongIds>) -> Key {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
     if id.len() <= 15 {

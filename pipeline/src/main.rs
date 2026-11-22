@@ -593,7 +593,7 @@ struct Context {
 
 
 /// Events steps 3 (validate) and 4 (late) for one copy: Some((user_id bytes, ts, price, category)).
-#[inline]
+#[inline(always)]
 fn judge<'a>(context: &Context, fields: &[Option<&'a [u8]>; 7], ingest: i64, dates: &mut ts::DateCache) -> Option<(&'a [u8], i64, u32, u32)> {
     let [_, user, ts, _, kind, product, price] = *fields;
     let (user, product, kind) = (user?, product?, kind?);
@@ -699,7 +699,7 @@ fn parse_chunk(
             let file_seq = (chunk.file as u64) << 40;
             // Step 1: for_each_record drops malformed lines.
             let window_start = context.window.0;
-            for_each_record::<7>(bytes_of(&event_maps[chunk.file]), chunk.start, chunk.end, |fields, offset| {
+            for_each_record::<7>(bytes_of(&event_maps[chunk.file]), chunk.start, chunk.end, #[inline(always)] |fields, offset| {
                 let Some(event_id) = fields[0] else { return }; // step 1: empty event_id
                 let ingest = fields[3].and_then(|v| ts::parse_ingest(v, &mut state.dates)).unwrap_or(NEVER);
                 if context.compact {
