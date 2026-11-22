@@ -1079,6 +1079,9 @@ fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>]
             unsafe {
                 use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
                 _mm_prefetch(table.as_ptr().wrapping_add(i).cast::<i8>(), _MM_HINT_T0);
+                if let Some(lines) = slow_seqs.get(((user >> 40) & 0x7F_FFFF) as usize) {
+                    _mm_prefetch(lines.as_ptr().wrapping_add(i).cast::<i8>(), _MM_HINT_T0);
+                }
             }
         }
     };
@@ -1098,7 +1101,7 @@ fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>]
     for at in 0..AHEAD.min(n) {
         let raw = survivors32[at].0 as u64;
         if want_lines {
-            ring[at % (2 * AHEAD)] = line_of(raw);
+            ring[at % (2 * AHEAD)] = raw;
         }
         let user = resolve(raw);
         survivors32[at].0 = user;
@@ -1111,7 +1114,7 @@ fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>]
         if at + AHEAD < n {
             let raw = survivors32[at + AHEAD].0 as u64;
             if want_lines {
-                ring[(at + AHEAD) % (2 * AHEAD)] = line_of(raw);
+                ring[(at + AHEAD) % (2 * AHEAD)] = raw;
             }
             let user = resolve(raw);
             survivors32[at + AHEAD].0 = user;
@@ -1124,12 +1127,12 @@ fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>]
             Event { person, ts: window_start + i64::from(ts), price: price_cat >> 8, category: price_cat & 0xFF },
         );
         if let Some(seqs) = seqs.as_deref_mut() {
-            let line = ring[at % (2 * AHEAD)];
-            if line != NOSEQ && person == user && crate::key::is_long(person) {
+            let raw = ring[at % (2 * AHEAD)];
+            if raw & compact::SLOW_USER != 0 && person == user && crate::key::is_long(person) {
                 let slot = ((person >> 8) as usize) & (NAME_FILTER - 1);
                 if recent[slot] != person {
                     recent[slot] = person;
-                    seqs.push(person_partition(person), ([person as u64, (person >> 64) as u64], line));
+                    seqs.push(person_partition(person), ([person as u64, (person >> 64) as u64], line_of(raw)));
                 }
             }
         }
