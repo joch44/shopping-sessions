@@ -1575,13 +1575,17 @@ fn run() -> Result<()> {
     // reuse event blocks; 2x the input leaves ample room (beyond it, slabs fall back to mmap).
     blocks::reserve(2 * (total_bytes(&event_maps) + total_bytes(&click_maps)) + (256 << 20));
     let next_thread = AtomicUsize::new(0);
+    let early_reserve = std::env::var("EARLY_CLICKS").as_deref() != Ok("0");
     let new_events = || ParseState {
         events: Scatter::new(dedup_parts, if compact { 0 } else { event_cap }),
         events32: BlockScatter::new_paired(dedup_parts), // empty lists cost nothing
         slow_users: Vec::new(),
         thread: next_thread.fetch_add(1, Ordering::Relaxed) as u64,
         clicks: BlockScatter::new(0),
-        early_clicks: Vec::new(),
+        // Room for twice this thread's share of the click lines (~47 bytes each): reserved,
+        // not touched, so a thread that parses few clicks costs nothing; growing by realloc
+        // copied (and faulted in) the whole vector again each time.
+        early_clicks: Vec::with_capacity(if early_reserve { total_bytes(&click_maps) / 47 * 2 / threads } else { 0 }),
         dates: ts::DateCache::default(),
     };
     let new_clicks = || ParseState {
