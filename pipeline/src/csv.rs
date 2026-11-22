@@ -51,6 +51,8 @@ pub fn parse_line<'a, const N: usize>(line: &'a [u8], out: &mut [Option<&'a [u8]
 /// With AVX-512BW, each line is split with three 128-byte compare masks (`\n`, `,`, `"`)
 /// from masked loads, which never touch bytes past the end of `data`. A line of 128
 /// bytes or more takes the scalar `parse_line`; both paths accept exactly the same lines.
+const PREFETCH_AHEAD: usize = 1024;
+
 #[inline]
 pub fn for_each_record<'a, const N: usize>(
     data: &'a [u8],
@@ -66,6 +68,12 @@ pub fn for_each_record<'a, const N: usize>(
         #[cfg(all(target_arch = "x86_64", any(target_feature = "avx512bw", target_feature = "avx2"), target_feature = "bmi2"))]
         {
             let remaining = data.len() - pos;
+            // Software prefetch ~PREFETCH_AHEAD bytes ahead (a hint: never faults, may be past the end).
+            // SAFETY: _mm_prefetch never dereferences; wrapping_add keeps the pointer arithmetic defined.
+            unsafe {
+                use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                _mm_prefetch::<_MM_HINT_T0>(data.as_ptr().wrapping_add(pos + PREFETCH_AHEAD).cast());
+            }
             // SAFETY: masks128 reads only bytes in pos..data.len() (see its two versions).
             let (newlines, commas, quotes) = unsafe { masks128(data.as_ptr().add(pos), remaining) };
             if newlines != 0 || remaining < 128 {
