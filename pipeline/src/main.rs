@@ -27,7 +27,7 @@ mod ts;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use memmap2::Mmap;
@@ -560,6 +560,19 @@ struct EventCopy {
 
 const INVALID: u32 = u32::MAX;
 
+/// Single-write event path (64-byte path only, `Context::single`): each copy of an event leaves
+/// this 40-byte dedup record in its event_id partition, while a valid copy's payload goes once,
+/// as an `Event`, straight into its person's partition (`r` locates it). Dedup only marks the
+/// losing payloads dropped; no event is copied twice.
+#[derive(Clone, Copy)]
+struct DRec {
+    id: [u64; 2],
+    ingest: i64,
+    seq: u64,
+    r: u64, // NOREF for an invalid copy, else thread << 56 | person partition << 40 | index
+}
+const NOREF: u64 = u64::MAX;
+
 #[derive(Clone, Copy)]
 pub struct Event {
     pub person: Key,
@@ -588,6 +601,8 @@ struct Context {
     /// their event lines in sessions, instead of recording every row's user_id. NAME_FROM_LINES=0
     /// turns it off (also used by the rerun when a name cannot be read).
     name_from_lines: bool,
+    /// Single-write event path (links first; see DRec). Only on the 64-byte path.
+    single: bool,
 }
 
 
@@ -649,6 +664,45 @@ struct ParseState {
     thread: u64,                    // index of this state's thread (for slow_users references)
     clicks: BlockScatter<Click>,    // by person partition
     dates: ts::DateCache,
+    drecs: Scatter<DRec>,            // single: dedup records by event_id partition
+    pevents: BlockScatter<Event>,    // single: valid payloads by person partition
+    pseqs: BlockScatter<u64>,        // single + name_from_lines: each payload's line, in step
+    pending: Vec<PendingEvent>,      // single: valid copies whose person lookup is prefetched
+}
+
+/// A valid copy waiting for its person (looked up in batches, each prefetched on entry).
+#[derive(Clone, Copy)]
+struct PendingEvent {
+    user: Key,
+    id: Key,
+    ingest: i64,
+    seq: u64,
+    ts: i64,
+    price: u32,
+    category: u32,
+}
+
+const EVENT_BATCH: usize = 64;
+
+/// Resolves a batch of valid copies' persons, writes each payload into its person partition and
+/// its dedup record (with the payload's location) into its event_id partition.
+#[inline(never)]
+fn flush_events(people: &People, state: &mut ParseState, name_from_lines: bool) {
+    let pending = std::mem::take(&mut state.pending);
+    for e in &pending {
+        let person = people.get(e.user);
+        let q = person_partition(person);
+        let index = state.pevents.len(q) as u64;
+        state.pevents.push(q, Event { person, ts: e.ts, price: e.price, category: e.category });
+        if name_from_lines {
+            state.pseqs.push(q, e.seq);
+        }
+        let r = state.thread << 56 | (q as u64) << 40 | index;
+        state.drecs.push(dedup_partition(e.id), DRec { id: [e.id as u64, (e.id >> 64) as u64], ingest: e.ingest, seq: e.seq, r });
+    }
+    let mut pending = pending;
+    pending.clear();
+    state.pending = pending;
 }
 
 /// Maps a chunk's page-cache pages into the page table with one MADV_POPULATE_READ call before
@@ -719,6 +773,21 @@ fn parse_chunk(
                 }
                 let id = key_of(event_id, None);
                 let seq = file_seq | offset as u64;
+                if context.single {
+                    let people = people.expect("single: links resolved before events");
+                    match judge(context, fields, ingest, &mut state.dates) {
+                        Some((user, ts, price, category)) => {
+                            let user = if context.name_from_lines { key_of(user, None) } else { key_of_deferred(user, &context.longs) };
+                            people.prefetch(user);
+                            state.pending.push(PendingEvent { user, id, ingest, seq, ts, price, category });
+                            if state.pending.len() == EVENT_BATCH {
+                                flush_events(people, state, context.name_from_lines);
+                            }
+                        }
+                        None => state.drecs.push(dedup_partition(id), DRec { id: [id as u64, (id >> 64) as u64], ingest, seq, r: NOREF }),
+                    }
+                    return;
+                }
                 let copy = match judge(context, fields, ingest, &mut state.dates) {
                     Some((user, ts, price, category)) => {
                         // On the 64-byte path (compact off) a person's name is read once from one of
@@ -732,6 +801,14 @@ fn parse_chunk(
                 state.events.push(dedup_partition(id), copy);
             });
             state.events32.flush();
+            if context.single {
+                if let Some(people) = people {
+                    flush_events(people, state, context.name_from_lines);
+                }
+                state.drecs.flush();
+                state.pevents.flush();
+                state.pseqs.flush();
+            }
             crate::scatter::fence(); // the arena is read by other threads in dedup
         }
         Kind::Click => {
@@ -854,6 +931,54 @@ fn dedup(pieces: Vec<&[EventCopy]>, people: &People, scratch: &mut DedupScratch,
         out.push(person_partition(person), Event { person, ts: copy.ts, price: copy.price, category: copy.category });
         if let Some(seqs) = seqs.as_deref_mut() {
             seqs.push(person_partition(person), copy.seq);
+        }
+    }
+}
+
+/// Single path: among the copies of each event_id in one partition, the one with the smallest
+/// (ingest_ts, file position) wins (rules.md Events step 2; equal ingest_ts copies are identical,
+/// the position only makes the choice deterministic). Every other copy's payload is marked
+/// dropped. An invalid winner has no payload, so all of that event's valid copies are dropped.
+fn dedup_single(pieces: Vec<&[DRec]>, drops: &[Vec<Vec<AtomicU64>>], scratch: &mut DedupScratch) {
+    let total: usize = pieces.iter().map(|piece| piece.len()).sum();
+    assert!(total < u32::MAX as usize, "dedup partition over 4G copies");
+    let copies: Vec<&DRec> = pieces.iter().copied().flatten().collect();
+    let mark = |r: u64| {
+        if r != NOREF {
+            let (t, q, index) = ((r >> 56) as usize, ((r >> 40) & 0xFFFF) as usize, (r & ((1 << 40) - 1)) as usize);
+            drops[t][q][index / 64].fetch_or(1 << (index % 64), Ordering::Relaxed);
+        }
+    };
+    const EMPTY: u64 = u64::MAX;
+    let slots = (total * 2).next_power_of_two().max(16);
+    let mask = slots - 1;
+    let table = &mut scratch.table;
+    table.clear();
+    table.resize(slots, EMPTY);
+    for (index, copy) in copies.iter().enumerate() {
+        let id = Key::from(copy.id[0]) | Key::from(copy.id[1]) << 64;
+        let h = mix(id);
+        let tag = h >> 32;
+        let mut slot = (h >> 20) as usize & mask;
+        loop {
+            let held = table[slot];
+            if held == EMPTY {
+                table[slot] = (tag << 32) | index as u64;
+                break;
+            }
+            if held >> 32 == tag {
+                let other = copies[held as u32 as usize];
+                if other.id == copy.id {
+                    if (copy.ingest, copy.seq) < (other.ingest, other.seq) {
+                        mark(other.r);
+                        table[slot] = (tag << 32) | index as u64;
+                    } else {
+                        mark(copy.r);
+                    }
+                    break;
+                }
+            }
+            slot = (slot + 1) & mask;
         }
     }
 }
@@ -1246,6 +1371,9 @@ impl Names<'_> {
 
 fn people_partition<T: TsOffset>(
     event_pieces: Vec<&[Event]>,
+    // Single path: per piece, its thread's dropped bits and the piece's first index there
+    // (empty otherwise: no event is dropped).
+    drops: &[(&[AtomicU64], usize)],
     click_pieces: Vec<&[Click]>,
     longs: &LongIds,
     state: &mut PeopleState,
@@ -1283,8 +1411,18 @@ fn people_partition<T: TsOffset>(
     keyed.clear();
     keyed_purchases.clear();
     let mut seqs = names.seq_pieces.iter().copied().flatten();
-    for event in event_pieces.iter().copied().flatten() {
+    let dropped = |piece: usize, k: usize| -> bool {
+        drops.get(piece).is_some_and(|&(bits, start)| {
+            let i = start + k;
+            bits[i / 64].load(Ordering::Relaxed) >> (i % 64) & 1 == 1
+        })
+    };
+    for (piece_index, piece) in event_pieces.iter().enumerate() {
+    for (k, event) in piece.iter().enumerate() {
         let seq = seqs.next();
+        if dropped(piece_index, k) {
+            continue;
+        }
         let group = match find(table, group_keys, event.person) {
             (_, Some(group)) => group,
             (slot, None) => {
@@ -1308,6 +1446,7 @@ fn people_partition<T: TsOffset>(
         if event.price > 0 {
             keyed_purchases.push((group, Purchase { ts: ts_rel, price: event.price, category: event.category }));
         }
+    }
     }
     let groups = group_keys.len();
     // Counting sort of events, then of clicks, into group order.
@@ -1479,7 +1618,8 @@ fn run() -> Result<()> {
             Ok("1") => true,
             _ => many_long_users(&event_maps),
         };
-    let context = Context { window, products, unknown_category, campaigns, longs: LongIds::default(), compact, name_from_lines };
+    let single = !compact && std::env::var("SINGLE").as_deref() != Ok("0");
+    let context = Context { window, products, unknown_category, campaigns, longs: LongIds::default(), compact, name_from_lines, single };
 
     // A+B. Task 0 resolves links while the other threads parse events (largest chunks
     // first). resolve_people fans its phases out over `threads` workers of its own, so links
@@ -1501,13 +1641,19 @@ fn run() -> Result<()> {
     // reuse event blocks; 2x the input leaves ample room (beyond it, slabs fall back to mmap).
     blocks::reserve(2 * (total_bytes(&event_maps) + total_bytes(&click_maps)) + (256 << 20));
     let next_thread = AtomicUsize::new(0);
+    // Dedup records are 40 of the 64 bytes an EventCopy takes: same pre-sizing, scaled.
+    let drec_cap = event_cap * 40 / 64 + 1;
     let new_events = || ParseState {
-        events: Scatter::new(dedup_parts, if compact { 0 } else { event_cap }),
+        events: Scatter::new(dedup_parts, if compact || single { 0 } else { event_cap }),
         events32: BlockScatter::new_paired(dedup_parts), // empty lists cost nothing
         slow_users: Vec::new(),
         thread: next_thread.fetch_add(1, Ordering::Relaxed) as u64,
         clicks: BlockScatter::new(0),
         dates: ts::DateCache::default(),
+        drecs: Scatter::new(if single { dedup_parts } else { 0 }, if single { drec_cap } else { 0 }),
+        pevents: if single { BlockScatter::new_paired(person_parts) } else { BlockScatter::new(0) },
+        pseqs: BlockScatter::new(if single && name_from_lines { person_parts } else { 0 }),
+        pending: Vec::with_capacity(if single { EVENT_BATCH } else { 0 }),
     };
     let new_clicks = || ParseState {
         events: Scatter::new(dedup_parts, 0),
@@ -1516,8 +1662,24 @@ fn run() -> Result<()> {
         thread: u64::MAX,
         clicks: BlockScatter::new(person_parts),
         dates: ts::DateCache::default(),
+        drecs: Scatter::new(0, 0),
+        pevents: BlockScatter::new(0),
+        pseqs: BlockScatter::new(0),
+        pending: Vec::new(),
     };
+    // Single-write path: links first on all threads (events need their person while parsed).
+    if single {
+        *people_slot.lock().unwrap() = Some(resolve_people(&link_maps, threads, &context.longs));
+        timer.mark("links (single)");
+    }
+    let people_early = people_slot.lock().unwrap().take();
     let parsed = run_tasks(threads, event_chunks.len() + 1, new_events, |state, at| {
+        if single {
+            if at > 0 {
+                parse_chunk(&context, people_early.as_ref(), &event_maps, &click_maps, event_chunks[at - 1], state);
+            }
+            return;
+        }
         if at == 0 {
             // The link phases run on this task's thread plus one more: the other pool threads are
             // busy parsing, so more link workers would put well over NCPU threads in the
@@ -1532,7 +1694,10 @@ fn run() -> Result<()> {
             parse_chunk(&context, None, &event_maps, &click_maps, event_chunks[at - 1], state);
         }
     });
-    let people = people_slot.into_inner().unwrap().expect("links resolved");
+    let people = match people_early {
+        Some(people) => people,
+        None => people_slot.into_inner().unwrap().expect("links resolved"),
+    };
     timer.mark("links || parse events");
     let mut click_chunks = Vec::new();
     chunks_of(Kind::Click, &click_maps, &mut click_chunks);
@@ -1543,11 +1708,30 @@ fn run() -> Result<()> {
     let mut slow_users: Vec<Vec<Key>> = (0..threads).map(|_| Vec::new()).collect();
     let mut event_parts: Vec<Scatter<EventCopy>> = Vec::new();
     let mut event32_parts: Vec<BlockScatter<EventCopy32>> = Vec::new();
+    // Single path, indexed by each state's thread number (payload references use it).
+    let mut drec_parts: Vec<Scatter<DRec>> = Vec::new();
+    let mut single_events: Vec<Option<BlockScatter<Event>>> = (0..threads).map(|_| None).collect();
+    let mut single_seqs: Vec<Option<BlockScatter<u64>>> = (0..threads).map(|_| None).collect();
     for state in parsed {
         slow_users[state.thread as usize] = state.slow_users;
         event_parts.push(state.events);
         event32_parts.push(state.events32);
+        drec_parts.push(state.drecs);
+        single_events[state.thread as usize] = Some(state.pevents);
+        single_seqs[state.thread as usize] = Some(state.pseqs);
     }
+    // One dropped-bit per payload, per (thread, person partition), set by dedup for losing copies.
+    let drops: Vec<Vec<Vec<AtomicU64>>> = if single {
+        single_events
+            .iter()
+            .map(|events| match events {
+                Some(events) => (0..person_parts).map(|q| (0..events.len(q).div_ceil(64)).map(|_| AtomicU64::new(0)).collect()).collect(),
+                None => Vec::new(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let click_parts: Vec<BlockScatter<Click>> = clicked.into_iter().map(|s| s.clicks).collect();
     // Deferred long IDs (event and click IDs) become readable here, before sessions and output.
     context.longs.build(threads);
@@ -1574,6 +1758,14 @@ fn run() -> Result<()> {
     let event_maps_ref: &[Option<Mmap>] = event_maps.as_deref().unwrap_or(&[]);
 
     // C. dedup per event_id partition.
+    if single {
+        run_tasks(threads, dedup_parts, DedupScratch::default, |scratch, p| {
+            let pieces: Vec<&[DRec]> = drec_parts.iter().flat_map(|scatter| scatter.pieces(p)).filter(|s| !s.is_empty()).collect();
+            if !pieces.is_empty() {
+                dedup_single(pieces, &drops, scratch);
+            }
+        });
+    }
     let deduped = run_tasks(
         threads,
         dedup_parts,
@@ -1596,7 +1788,12 @@ fn run() -> Result<()> {
             }
         },
     );
-    let (person_events, person_seqs): (Vec<BlockScatter<Event>>, Vec<BlockScatter<u64>>) = deduped.into_iter().map(|(_, out, seqs)| (out, seqs)).unzip();
+    let (mut person_events, mut person_seqs): (Vec<BlockScatter<Event>>, Vec<BlockScatter<u64>>) = deduped.into_iter().map(|(_, out, seqs)| (out, seqs)).unzip();
+    if single {
+        // Payloads stayed where parsing put them; in thread order, matching `drops`.
+        person_events = single_events.into_iter().map(|s| s.unwrap_or_else(|| BlockScatter::new(0))).collect();
+        person_seqs = single_seqs.into_iter().map(|s| s.unwrap_or_else(|| BlockScatter::new(0))).collect();
+    }
     timer.mark("dedup");
     if TIE_CONFLICT.load(Ordering::Relaxed) {
         // Nothing has been written yet: start over on the exact path (same args, same env).
@@ -1627,16 +1824,36 @@ fn run() -> Result<()> {
         },
         |state, at| {
             let q = order[at];
-            let event_pieces: Vec<&[Event]> = person_events.iter().flat_map(|scatter| scatter.pieces(q)).filter(|s| !s.is_empty()).collect();
+            // Single path: each piece with its thread's dropped bits and its first index there.
+            let mut drop_info: Vec<(&[AtomicU64], usize)> = Vec::new();
+            let event_pieces: Vec<&[Event]> = if single {
+                let mut pieces = Vec::new();
+                for (t, scatter) in person_events.iter().enumerate() {
+                    if scatter.len(q) == 0 {
+                        continue;
+                    }
+                    let mut start = 0usize;
+                    for piece in scatter.pieces(q) {
+                        if !piece.is_empty() {
+                            pieces.push(piece);
+                            drop_info.push((&drops[t][q][..], start));
+                        }
+                        start += piece.len();
+                    }
+                }
+                pieces
+            } else {
+                person_events.iter().flat_map(|scatter| scatter.pieces(q)).filter(|s| !s.is_empty()).collect()
+            };
             // In step with event_pieces (same pushes, same block sizes) on the 64-byte path.
             let seq_pieces: Vec<&[u64]> = if !context.name_from_lines { Vec::new() } else { person_seqs.iter().flat_map(|scatter| scatter.pieces(q)).filter(|s| !s.is_empty()).collect() };
             let names = Names { seq_pieces, event_maps: event_maps_ref };
             let click_pieces: Vec<&[Click]> = click_parts.iter().flat_map(|scatter| scatter.pieces(q)).filter(|s| !s.is_empty()).collect();
             // Every event ts lies in [window_start, window_end): u32 offsets fit when the window does.
             if context.window.1 - context.window.0 <= i64::from(u32::MAX) {
-                people_partition::<u32>(event_pieces, click_pieces, &context.longs, state, &category_names, context.window.0, &names);
+                people_partition::<u32>(event_pieces, &drop_info, click_pieces, &context.longs, state, &category_names, context.window.0, &names);
             } else {
-                people_partition::<i64>(event_pieces, click_pieces, &context.longs, state, &category_names, context.window.0, &names);
+                people_partition::<i64>(event_pieces, &drop_info, click_pieces, &context.longs, state, &category_names, context.window.0, &names);
             }
             // Names read in this partition become one batch for the build below.
             context.longs.close_unit();
