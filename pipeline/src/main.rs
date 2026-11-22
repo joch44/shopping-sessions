@@ -657,7 +657,7 @@ struct ParseState {
 /// nothing changes. POPULATE=0 turns it off (A/B experiments).
 fn populate_chunk(data: &[u8], start: usize, end: usize) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var("POPULATE").as_deref() != Ok("0")) || data.is_empty() {
+    if !*ON.get_or_init(|| std::env::var("POPULATE").as_deref() == Ok("1")) || data.is_empty() {
         return;
     }
     const MADV_POPULATE_READ: libc::c_int = 22;
@@ -1526,7 +1526,7 @@ fn run() -> Result<()> {
             // 17-byte user IDs (links on the critical path): 1/2/4/8 link threads -> 6.21/5.12/
             // 5.11/5.24 s with 77/127/846/945 ms throttled; normal data never runs this code.
             // LINK_THREADS overrides (experiments).
-            let link_threads = std::env::var("LINK_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0).unwrap_or(2);
+            let link_threads = std::env::var("LINK_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0).unwrap_or(3);
             *people_slot.lock().unwrap() = Some(resolve_people(&link_maps, link_threads, &context.longs));
         } else {
             parse_chunk(&context, None, &event_maps, &click_maps, event_chunks[at - 1], state);
