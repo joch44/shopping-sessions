@@ -819,7 +819,11 @@ fn flush_clicks(people: &People, pending: &mut Vec<(Key, Click)>, out: &mut Bloc
 /// per copy and emitted in record order: both passes over the records are sequential.
 /// `seqs`: on the 64-byte path, each survivor's line (file and offset) in step with `out`, for
 /// naming its person in sessions.
-fn dedup(pieces: Vec<&[EventCopy]>, people: &People, scratch: &mut DedupScratch, out: &mut BlockScatter<Event>, mut seqs: Option<&mut BlockScatter<u64>>) {
+/// Names from lines: (person key as two words, seq of one of its event lines), written by dedup
+/// only for a survivor whose person is its own long user_id (an unlinked long ID).
+type NameRef = ([u64; 2], u64);
+
+fn dedup(pieces: Vec<&[EventCopy]>, people: &People, scratch: &mut DedupScratch, out: &mut BlockScatter<Event>, mut seqs: Option<&mut BlockScatter<NameRef>>) {
     let total: usize = pieces.iter().map(|piece| piece.len()).sum();
     assert!(total < u32::MAX as usize, "dedup partition over 4G copies");
     let starts: Vec<usize> = pieces.iter().scan(0, |at, piece| { let start = *at; *at += piece.len(); Some(start) }).collect();
@@ -873,6 +877,8 @@ fn dedup(pieces: Vec<&[EventCopy]>, people: &People, scratch: &mut DedupScratch,
         }
     }
     const AHEAD: usize = 16;
+    const NAME_FILTER: usize = 256;
+    let mut recent = [0 as Key; NAME_FILTER];
     for copy in survivors.iter().take(AHEAD) {
         people.prefetch(copy.user);
     }
@@ -884,7 +890,15 @@ fn dedup(pieces: Vec<&[EventCopy]>, people: &People, scratch: &mut DedupScratch,
         let person = people.get(copy.user);
         out.push(person_partition(person), Event { person, ts: copy.ts, price: copy.price, category: copy.category });
         if let Some(seqs) = seqs.as_deref_mut() {
-            seqs.push(person_partition(person), copy.seq);
+            // Only an unlinked long ID needs its line (a linked person is named from the links,
+            // a short ID by its key); a small filter drops most repeats of one person.
+            if person == copy.user && crate::key::is_long(person) {
+                let slot = ((person >> 8) as usize) & (NAME_FILTER - 1);
+                if recent[slot] != person {
+                    recent[slot] = person;
+                    seqs.push(person_partition(person), ([person as u64, (person >> 64) as u64], copy.seq));
+                }
+            }
         }
     }
 }
@@ -1288,7 +1302,7 @@ fn person_sessions<T: TsOffset>(person: Key, ts_rel: &[T], purchases: &[Purchase
 /// Where sessions find the name of a person with a long ID that no link names: on the 64-byte
 /// path, each event's line (`seq_pieces`, in step with the event pieces) in `event_maps`.
 struct Names<'a> {
-    seq_pieces: Vec<&'a [u64]>,
+    seq_pieces: Vec<&'a [NameRef]>,
     event_maps: &'a [Option<Mmap>],
 }
 
@@ -1341,9 +1355,9 @@ fn people_partition<T: TsOffset>(
     // -0.043 s @60M).
     keyed.clear();
     keyed_purchases.clear();
-    let mut seqs = names.seq_pieces.iter().copied().flatten();
+    // Built on first need: this partition's unlinked long persons and one line of each.
+    let mut lines: Option<FxHashMap<Key, u64>> = None;
     for event in event_pieces.iter().copied().flatten() {
-        let seq = seqs.next();
         let group = match find(table, group_keys, event.person) {
             (_, Some(group)) => group,
             (slot, None) => {
@@ -1351,12 +1365,13 @@ fn people_partition<T: TsOffset>(
                 group_keys.push(event.person);
                 // A person with a long ID that no link names is named by this event's own
                 // user_id (an unlinked person's events all carry that one ID): read it once.
-                if let Some(seq) = seq {
-                    if crate::key::is_long(event.person) && longs.slice(event.person).is_empty() {
-                        match names.user_at(*seq) {
-                            Some(id) if key_of(id, None) == event.person => longs.defer_name(event.person, id),
-                            _ => NAME_MISSING.store(true, Ordering::Relaxed),
-                        }
+                if !names.seq_pieces.is_empty() && crate::key::is_long(event.person) && longs.slice(event.person).is_empty() {
+                    let lines = lines.get_or_insert_with(|| {
+                        names.seq_pieces.iter().copied().flatten().map(|&(k, seq)| ((k[0] as Key) | ((k[1] as Key) << 64), seq)).collect()
+                    });
+                    match lines.get(&event.person).and_then(|&seq| names.user_at(seq)) {
+                        Some(id) if key_of(id, None) == event.person => longs.defer_name(event.person, id),
+                        _ => NAME_MISSING.store(true, Ordering::Relaxed),
                     }
                 }
                 (group_keys.len() - 1) as u32
@@ -1655,7 +1670,7 @@ fn run() -> Result<()> {
     let deduped = run_tasks(
         threads,
         dedup_parts + click_tasks.len(),
-        || (DedupScratch::default(), BlockScatter::new(person_parts), BlockScatter::<u64>::new(if context.name_from_lines { person_parts } else { 0 }), BlockScatter::<Click>::new(if early { person_parts } else { 0 })),
+        || (DedupScratch::default(), BlockScatter::new(person_parts), BlockScatter::<NameRef>::new(if context.name_from_lines { person_parts } else { 0 }), BlockScatter::<Click>::new(if early { person_parts } else { 0 })),
         |(scratch, out, seqs, clicks_out), p| {
             if p >= dedup_parts {
                 let (t, start, end) = click_tasks[p - dedup_parts];
@@ -1679,7 +1694,7 @@ fn run() -> Result<()> {
             }
         },
     );
-    let (person_events, person_seqs): (Vec<BlockScatter<Event>>, Vec<BlockScatter<u64>>) = deduped.into_iter().map(|(_, out, seqs, clicks_out)| { if early { click_parts.push(clicks_out); } (out, seqs) }).unzip();
+    let (person_events, person_seqs): (Vec<BlockScatter<Event>>, Vec<BlockScatter<NameRef>>) = deduped.into_iter().map(|(_, out, seqs, clicks_out)| { if early { click_parts.push(clicks_out); } (out, seqs) }).unzip();
     timer.mark("dedup");
     if TIE_CONFLICT.load(Ordering::Relaxed) {
         // Nothing has been written yet: start over on the exact path (same args, same env).
@@ -1712,7 +1727,7 @@ fn run() -> Result<()> {
             let q = order[at];
             let event_pieces: Vec<&[Event]> = person_events.iter().flat_map(|scatter| scatter.pieces(q)).filter(|s| !s.is_empty()).collect();
             // In step with event_pieces (same pushes, same block sizes) on the 64-byte path.
-            let seq_pieces: Vec<&[u64]> = if !context.name_from_lines { Vec::new() } else { person_seqs.iter().flat_map(|scatter| scatter.pieces(q)).filter(|s| !s.is_empty()).collect() };
+            let seq_pieces: Vec<&[NameRef]> = if !context.name_from_lines { Vec::new() } else { person_seqs.iter().flat_map(|scatter| scatter.pieces(q)).filter(|s| !s.is_empty()).collect() };
             let names = Names { seq_pieces, event_maps: event_maps_ref };
             let click_pieces: Vec<&[Click]> = click_parts.iter().flat_map(|scatter| scatter.pieces(q)).filter(|s| !s.is_empty()).collect();
             // Every event ts lies in [window_start, window_end): u32 offsets fit when the window does.
