@@ -131,18 +131,24 @@ unsafe fn masks128(p: *const u8, remaining: usize) -> (u128, u128, u128) {
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
 #[inline(always)]
 unsafe fn masks128(p: *const u8, remaining: usize) -> (u128, u128, u128) {
+    // Four 256-bit masked loads and compares (AVX-512 BW/VL on ymm registers): no 512-bit
+    // register, which on Cascade Lake lowers the core clock for the code around it.
     use std::arch::x86_64::*;
-    let lo_mask: u64 = if remaining >= 64 { u64::MAX } else { (1u64 << remaining) - 1 };
-    let hi_mask: u64 = if remaining >= 128 { u64::MAX } else if remaining > 64 { (1u64 << (remaining - 64)) - 1 } else { 0 };
+    let mut nl = 0u128;
+    let mut cm = 0u128;
+    let mut qt = 0u128;
     unsafe {
-        let lo = _mm512_maskz_loadu_epi8(lo_mask, p.cast());
-        let hi = _mm512_maskz_loadu_epi8(hi_mask, p.add(64).cast());
-        let eq = |byte: u8| {
-            let x = _mm512_set1_epi8(byte as i8);
-            u128::from(_mm512_mask_cmpeq_epi8_mask(lo_mask, lo, x)) | u128::from(_mm512_mask_cmpeq_epi8_mask(hi_mask, hi, x)) << 64
-        };
-        (eq(b'\n'), eq(b','), eq(b'"'))
+        let (xn, xc, xq) = (_mm256_set1_epi8(b'\n' as i8), _mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'"' as i8));
+        for i in 0..4usize {
+            let left = remaining.saturating_sub(32 * i);
+            let k: __mmask32 = if left >= 32 { u32::MAX } else { (1u32 << left) - 1 };
+            let v = _mm256_maskz_loadu_epi8(k, p.add(32 * i).cast());
+            nl |= u128::from(_mm256_mask_cmpeq_epi8_mask(k, v, xn)) << (32 * i);
+            cm |= u128::from(_mm256_mask_cmpeq_epi8_mask(k, v, xc)) << (32 * i);
+            qt |= u128::from(_mm256_mask_cmpeq_epi8_mask(k, v, xq)) << (32 * i);
+        }
     }
+    (nl, cm, qt)
 }
 
 /// Fields of one line (n = line.len() < 128 bytes, no `\n`) from its comma and quote masks;
