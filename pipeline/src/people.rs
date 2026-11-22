@@ -65,6 +65,8 @@ impl People {
         }
         let mut tags = vec![0u8; total];
         let mut cells = vec![(0, 0); total];
+        crate::blocks::hugepages(&tags);
+        crate::blocks::hugepages(&cells);
         let (tags_at, cells_at) = (tags.as_mut_ptr() as usize, cells.as_mut_ptr() as usize);
         crate::run_tasks(threads.max(1), SUBS, || (), |_, s| {
             // SAFETY: subtable s owns slots base[s]..=base[s]+mask[s]; no other task touches them.

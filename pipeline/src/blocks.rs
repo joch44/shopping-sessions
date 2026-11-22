@@ -18,6 +18,23 @@ const HUGE: usize = 2 << 20;
 const SLAB: usize = 2 << 20;
 const FALLBACK_CHUNK: usize = 64 << 20;
 
+/// Asks for 2 MiB pages on the whole 2 MiB-aligned part of a large buffer before it is first
+/// written (THP "madvise" mode grants them only on request; on Cascade Lake another team
+/// measured huge pages at ~150 ms of a 476 ms run). HUGE_BUFFERS=0 disables it.
+pub fn hugepages<T>(buf: &[T]) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let bytes = std::mem::size_of_val(buf);
+    if bytes < 8 << 20 || !*ON.get_or_init(|| std::env::var("HUGE_BUFFERS").as_deref() != Ok("0")) {
+        return;
+    }
+    let start = (buf.as_ptr() as usize + HUGE - 1) & !(HUGE - 1);
+    let end = (buf.as_ptr() as usize + bytes) & !(HUGE - 1);
+    if end > start {
+        // SAFETY: [start, end) lies inside `buf`'s allocation; MADV_HUGEPAGE is advisory only.
+        unsafe { libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_HUGEPAGE) };
+    }
+}
+
 static RES_NEXT: AtomicUsize = AtomicUsize::new(0);
 static RES_END: AtomicUsize = AtomicUsize::new(0);
 

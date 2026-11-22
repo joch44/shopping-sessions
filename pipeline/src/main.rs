@@ -1585,7 +1585,11 @@ fn run() -> Result<()> {
         // Room for twice this thread's share of the click lines (~47 bytes each): reserved,
         // not touched, so a thread that parses few clicks costs nothing; growing by realloc
         // copied (and faulted in) the whole vector again each time.
-        early_clicks: Vec::with_capacity(if early_reserve { total_bytes(&click_maps) / 47 * 2 / threads } else { 0 }),
+        early_clicks: {
+            let mut v = Vec::with_capacity(if early_reserve { total_bytes(&click_maps) / 47 * 2 / threads } else { 0 });
+            crate::blocks::hugepages(v.spare_capacity_mut());
+            v
+        },
         dates: ts::DateCache::default(),
     };
     let new_clicks = || ParseState {

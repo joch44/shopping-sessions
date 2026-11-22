@@ -35,6 +35,7 @@ impl<T: Copy> Scatter<T> {
         let mut data = Vec::with_capacity(parts * cap);
         // SAFETY: MaybeUninit needs no initialization; only written slots are ever read.
         unsafe { data.set_len(parts * cap) };
+        crate::blocks::hugepages(&data);
         let mut pending = Vec::with_capacity(parts);
         // SAFETY: MaybeUninit needs no initialization; a slot is read only after it was written.
         unsafe { pending.set_len(parts) };
