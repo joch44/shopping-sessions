@@ -83,11 +83,12 @@ impl<T: Copy> Scatter<T> {
                     // (checked when the first item was held); T is a 32-byte Copy type, so the
                     // two items' bytes form one __m512i.
                     unsafe {
-                        use std::arch::x86_64::{__m256i, __m512i, _mm512_inserti64x4, _mm512_castsi256_si512, _mm512_stream_si512};
+                        use std::arch::x86_64::{__m256i, _mm256_stream_si256};
                         let a = std::mem::transmute_copy::<T, __m256i>(self.pending[part].assume_init_ref());
                         let b = std::mem::transmute_copy::<T, __m256i>(&item);
-                        let line: __m512i = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(a), b);
-                        _mm512_stream_si512(slot.cast(), line);
+                        let dst: *mut __m256i = slot.cast();
+                        _mm256_stream_si256(dst, a);
+                        _mm256_stream_si256(dst.add(1), b);
                     }
                     self.has_pending[part] = false;
                     self.lens[part] = len + 1;
@@ -101,8 +102,11 @@ impl<T: Copy> Scatter<T> {
                     // SAFETY: slot is in bounds (len < cap), 64-byte aligned, and T is a 64-byte
                     // Copy type, so its bytes form one __m512i.
                     unsafe {
-                        use std::arch::x86_64::{__m512i, _mm512_stream_si512};
-                        _mm512_stream_si512(slot.cast(), std::mem::transmute_copy::<T, __m512i>(&item));
+                        use std::arch::x86_64::{__m256i, _mm256_stream_si256};
+                        let halves = std::mem::transmute_copy::<T, [__m256i; 2]>(&item);
+                        let dst: *mut __m256i = slot.cast();
+                        _mm256_stream_si256(dst, halves[0]);
+                        _mm256_stream_si256(dst.add(1), halves[1]);
                     }
                     self.lens[part] = len + 1;
                     return;

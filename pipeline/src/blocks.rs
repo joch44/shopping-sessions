@@ -162,11 +162,13 @@ impl<T: Copy> BlockScatter<T> {
             // pair starts 64-byte aligned (aligned block, 32-byte items, even index), and the
             // two items' bytes form one __m512i.
             unsafe {
-                use std::arch::x86_64::{__m256i, __m512i, _mm512_castsi256_si512, _mm512_inserti64x4, _mm512_stream_si512};
+                use std::arch::x86_64::{__m256i, _mm256_stream_si256};
                 let a = std::mem::transmute_copy::<T, __m256i>(self.pending[part].assume_init_ref());
                 let b = std::mem::transmute_copy::<T, __m256i>(&item);
-                let line: __m512i = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(a), b);
-                _mm512_stream_si512(block.add(fill as usize - 1).cast(), line);
+                // Two 32-byte non-temporal stores fill the same 64-byte line (no 512-bit register).
+                let dst: *mut __m256i = block.add(fill as usize - 1).cast();
+                _mm256_stream_si256(dst, a);
+                _mm256_stream_si256(dst.add(1), b);
             }
             self.has_pending[part] = false;
             self.cur[part].1 = fill + 1;
