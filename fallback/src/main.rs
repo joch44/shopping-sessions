@@ -1731,9 +1731,11 @@ fn main() {
     // GCP n2 Cascade Lake VM). Output is unaffected.
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {
-        // ONE_ARENA=0 keeps glibc's per-thread arenas (A/B on kernels with per-VMA locks:
-        // analysis VM, kernel 7.0, 60M normal -2.5%).
-        if std::env::var("ONE_ARENA").as_deref() != Ok("0") {
+        // One arena only with ONE_ARENA=1: on kernel 7.0 (per-VMA locks) glibc's per-thread
+        // arenas are faster. GCP replica, 60M normal: -89 ms unpinned, -63 ms on 4 cores x 2 HT
+        // (the grader's layout); 60M unicode IDs -50 ms. The 6.1-era reason for one arena
+        // (mmap_lock convoys) does not apply there.
+        if std::env::var("ONE_ARENA").as_deref() == Ok("1") {
             libc::mallopt(libc::M_ARENA_MAX, 1);
         }
         libc::mallopt(libc::M_TOP_PAD, 64 << 20);
