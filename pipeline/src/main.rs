@@ -201,6 +201,33 @@ fn mostly_packable(maps: &[Option<Mmap>]) -> bool {
     unpackable * 50 <= rows
 }
 
+/// No event line (names from lines: a packed user, named by its key).
+const NOSEQ: u64 = u64::MAX;
+
+/// A long-ID copy's `ingest` field: bits 0..34 its ingest_ts as ms after window_start - 2^33
+/// (2^34 - 1 for NEVER), bits 34..40 the parsing thread, bits 40..64 the index of its full key
+/// in that thread's side table. Out of range: TIE_CONFLICT reruns on the 64-byte path.
+const SLOW_ING_BITS: u32 = 34;
+const SLOW_ING_NEVER: u64 = (1 << SLOW_ING_BITS) - 1;
+fn slow_ingest(ingest: i64, window_start: i64, thread: u64, index: u64) -> i64 {
+    let base = window_start - (1i64 << 33);
+    let rel = if ingest == NEVER {
+        SLOW_ING_NEVER
+    } else {
+        let rel = ingest.wrapping_sub(base);
+        if !(0..SLOW_ING_NEVER as i64).contains(&rel) {
+            TIE_CONFLICT.store(true, Ordering::Relaxed);
+            return 0;
+        }
+        rel as u64
+    };
+    if thread >= 64 || index >= 1 << 24 {
+        TIE_CONFLICT.store(true, Ordering::Relaxed);
+        return 0;
+    }
+    (index << 40 | thread << SLOW_ING_BITS | rel) as i64
+}
+
 /// Whether more than 2% of sampled event rows have a user_id over 15 bytes (a long key):
 /// only then do sessions name persons from event lines (seq beside every Event, event files
 /// kept mapped); with few long IDs, recording them per row is cheaper.
@@ -588,6 +615,8 @@ struct Context {
     /// their event lines in sessions, instead of recording every row's user_id. NAME_FROM_LINES=0
     /// turns it off (also used by the rerun when a name cannot be read).
     name_from_lines: bool,
+    /// Compact path also for event_ids that do not pack (side-table references; see dedup32).
+    compact_slow: bool,
 }
 
 
@@ -646,6 +675,8 @@ struct ParseState {
     events: Scatter<EventCopy>,     // by event_id partition (all copies, or only unpackable event_ids when compact)
     events32: BlockScatter<EventCopy32>, // compact: packed event_ids, by partition of the packed id
     slow_users: Vec<Key>,           // compact: user keys that do not pack, referenced by EventCopy32.user
+    slow_ids: Vec<Key>,             // compact_slow: event_id keys that do not pack, referenced by EventCopy32.id
+    slow_seqs: Vec<u64>,            // compact + name_from_lines: each slow user's event line, in step with slow_users
     thread: u64,                    // index of this state's thread (for slow_users references)
     clicks: BlockScatter<Click>,    // by person partition
     early_clicks: Vec<Click>,       // parsed before links: `person` holds the user key until resolved
@@ -703,19 +734,45 @@ fn parse_chunk(
                 let Some(event_id) = fields[0] else { return }; // step 1: empty event_id
                 let ingest = fields[3].and_then(|v| ts::parse_ingest(v, &mut state.dates)).unwrap_or(NEVER);
                 if context.compact {
-                    if let Some(id) = compact::pack62(event_id) {
+                    // An event_id that does not pack (e.g. 1 in 8 IDs carries a 32-hex suffix) can
+                    // still take the compact path as a side-table reference: its partition comes from
+                    // its full key, and dedup32 compares such copies by that key.
+                    let packed = compact::pack62(event_id);
+                    let slow = if packed.is_none() && context.compact_slow { Some(key_of(event_id, None)) } else { None };
+                    if packed.is_some() || slow.is_some() {
+                    // A long ID's record carries 63 bits of its hash as `id` (bit 63 set) and, in
+                    // `ingest`, a reference to its full key beside its ingest_ts (see slow_ingest):
+                    // dedup reads the full key only when two such hashes are equal.
+                    let (id, ingest_field) = match (packed, slow) {
+                        (Some(id), _) => (id, ingest),
+                        (None, Some(key)) => {
+                            state.slow_ids.push(key);
+                            let index = state.slow_ids.len() as u64 - 1;
+                            (compact::SLOW_USER | (key >> 8) as u64, slow_ingest(ingest, window_start, state.thread, index))
+                        }
+                        _ => unreachable!(),
+                    };
+                    let part = (compact::mix64(id) as usize) & (dedup_partitions() - 1);
+                    {
                         let copy = match judge(context, fields, ingest, &mut state.dates) {
                             Some((user, ts, price, category)) => {
                                 let user = compact::pack62(user).unwrap_or_else(|| {
-                                    state.slow_users.push(key_of_deferred(user, &context.longs));
+                                    if context.name_from_lines {
+                                        // Named later from this line (see Names), not recorded here.
+                                        state.slow_users.push(key_of(user, None));
+                                        state.slow_seqs.push(file_seq | offset as u64);
+                                    } else {
+                                        state.slow_users.push(key_of_deferred(user, &context.longs));
+                                    }
                                     compact::SLOW_USER | state.thread << 40 | (state.slow_users.len() as u64 - 1)
                                 });
-                                EventCopy32 { id, user, ingest, ts: (ts - window_start) as u32, price_cat: price << 8 | category }
+                                EventCopy32 { id, user, ingest: ingest_field, ts: (ts - window_start) as u32, price_cat: price << 8 | category }
                             }
-                            None => EventCopy32 { id, user: 0, ingest, ts: 0, price_cat: compact::INVALID32 },
+                            None => EventCopy32 { id, user: 0, ingest: ingest_field, ts: 0, price_cat: compact::INVALID32 },
                         };
-                        state.events32.push((compact::mix64(id) as usize) & (dedup_partitions() - 1), copy);
+                        state.events32.push(part, copy);
                         return;
+                    }
                     }
                 }
                 let id = key_of(event_id, None);
@@ -920,7 +977,8 @@ static TIE_CONFLICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 
 /// `dedup` for packed copies (EventCopy32). Same table and passes; an equal-ingest tie keeps
 /// the copy already held (rules.md: copies with equal ingest_ts are identical).
-fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>], window_start: i64, scratch: &mut DedupScratch, out: &mut BlockScatter<Event>) {
+#[allow(clippy::too_many_arguments)]
+fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>], slow_ids: &[Vec<Key>], slow_seqs: &[Vec<u64>], window_start: i64, scratch: &mut DedupScratch, out: &mut BlockScatter<Event>, mut seqs: Option<&mut BlockScatter<NameRef>>) {
     let total: usize = pieces.iter().map(|piece| piece.len()).sum();
     assert!(total < u32::MAX as usize, "dedup partition over 4G copies");
     let starts: Vec<usize> = pieces.iter().scan(0, |at, piece| { let start = *at; *at += piece.len(); Some(start) }).collect();
@@ -949,6 +1007,21 @@ fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>]
         }
     };
     let same_user = |a: u64, b: u64| a == b || ((a | b) & compact::SLOW_USER != 0 && resolve(a) == resolve(b));
+    // An event_id that does not pack is a side-table reference (same bit as SLOW_USER): its
+    // copies hash and compare by their full key; a packed ID never equals an unpacked one.
+    let ing_base = window_start - (1i64 << 33);
+    let ingest_of = |c: &EventCopy32| -> i64 {
+        if c.id & compact::SLOW_USER == 0 {
+            return c.ingest;
+        }
+        let rel = c.ingest as u64 & SLOW_ING_NEVER;
+        if rel == SLOW_ING_NEVER { NEVER } else { ing_base + rel as i64 }
+    };
+    let key_ref = |c: &EventCopy32| {
+        let v = c.ingest as u64;
+        slow_ids[((v >> SLOW_ING_BITS) & 63) as usize][(v >> 40) as usize]
+    };
+    let same_id = |a: &EventCopy32, b: &EventCopy32| a.id == b.id && (a.id & compact::SLOW_USER == 0 || key_ref(a) == key_ref(b));
     let mut index: u32 = 0;
     for copy in pieces.iter().copied().flatten() {
         let h = compact::mix64(copy.id);
@@ -966,12 +1039,13 @@ fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>]
             if held >> 32 == tag {
                 let other_index = held as u32;
                 let other = copy_at(other_index);
-                if other.id == copy.id {
-                    if copy.ingest < other.ingest {
+                if same_id(other, copy) {
+                    let (ci, oi) = (ingest_of(copy), ingest_of(other));
+                    if ci < oi {
                         table[slot] = (tag << 32) | u64::from(index);
                         winner[other_index as usize] = false;
                         winner[index as usize] = true;
-                    } else if copy.ingest == other.ingest
+                    } else if ci == oi
                         && (copy.ts != other.ts || copy.price_cat != other.price_cat || !same_user(copy.user, other.user))
                     {
                         // Equal ingest_ts but different copies: impossible under rules.md (Events
@@ -986,20 +1060,62 @@ fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>]
         }
         index += 1;
     }
+    // Survivors with their raw user field first; then, in one pass, a long user's side-table
+    // entry is prefetched 2*AHEAD survivors ahead, resolved to its key AHEAD ahead (with its
+    // person lookup prefetched), and looked up at its own turn.
     survivors32.clear();
     for (copy, &won) in pieces.iter().copied().flatten().zip(winner.iter()) {
         if won && copy.price_cat != compact::INVALID32 {
-            let user = resolve(copy.user);
-            survivors32.push((user, copy.ts, copy.price_cat));
+            survivors32.push((Key::from(copy.user), copy.ts, copy.price_cat));
         }
     }
     const AHEAD: usize = 16;
-    for &(user, _, _) in survivors32.iter().take(AHEAD) {
+    let side_prefetch = |raw: Key| {
+        let user = raw as u64;
+        if user & compact::SLOW_USER != 0 {
+            let table = &slow_users[((user >> 40) & 0x7F_FFFF) as usize];
+            let i = (user & 0xFF_FFFF_FFFF) as usize;
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+                _mm_prefetch(table.as_ptr().wrapping_add(i).cast::<i8>(), _MM_HINT_T0);
+            }
+        }
+    };
+    let n = survivors32.len();
+    // Names from lines: each survivor's line (a slow user's; NOSEQ for a packed one, whose
+    // key holds its bytes), taken before the raw fields are replaced by keys.
+    // A slow user's line, taken when its raw field is resolved (AHEAD survivors early) and kept
+    // in a ring until its turn; only an unlinked long ID's line is written (see NameRef).
+    let want_lines = seqs.is_some();
+    let line_of = |raw: u64| if raw & compact::SLOW_USER != 0 { slow_seqs[((raw >> 40) & 0x7F_FFFF) as usize][(raw & 0xFF_FFFF_FFFF) as usize] } else { NOSEQ };
+    let mut ring = [NOSEQ; 2 * AHEAD];
+    const NAME_FILTER: usize = 256;
+    let mut recent = [0 as Key; NAME_FILTER];
+    for at in 0..(2 * AHEAD).min(n) {
+        side_prefetch(survivors32[at].0);
+    }
+    for at in 0..AHEAD.min(n) {
+        let raw = survivors32[at].0 as u64;
+        if want_lines {
+            ring[at % (2 * AHEAD)] = line_of(raw);
+        }
+        let user = resolve(raw);
+        survivors32[at].0 = user;
         people.prefetch(user);
     }
-    for at in 0..survivors32.len() {
-        if let Some(&(ahead, _, _)) = survivors32.get(at + AHEAD) {
-            people.prefetch(ahead);
+    for at in 0..n {
+        if at + 2 * AHEAD < n {
+            side_prefetch(survivors32[at + 2 * AHEAD].0);
+        }
+        if at + AHEAD < n {
+            let raw = survivors32[at + AHEAD].0 as u64;
+            if want_lines {
+                ring[(at + AHEAD) % (2 * AHEAD)] = line_of(raw);
+            }
+            let user = resolve(raw);
+            survivors32[at + AHEAD].0 = user;
+            people.prefetch(user);
         }
         let (user, ts, price_cat) = survivors32[at];
         let person = people.get(user);
@@ -1007,6 +1123,16 @@ fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>]
             person_partition(person),
             Event { person, ts: window_start + i64::from(ts), price: price_cat >> 8, category: price_cat & 0xFF },
         );
+        if let Some(seqs) = seqs.as_deref_mut() {
+            let line = ring[at % (2 * AHEAD)];
+            if line != NOSEQ && person == user && crate::key::is_long(person) {
+                let slot = ((person >> 8) as usize) & (NAME_FILTER - 1);
+                if recent[slot] != person {
+                    recent[slot] = person;
+                    seqs.push(person_partition(person), ([person as u64, (person >> 64) as u64], line));
+                }
+            }
+        }
     }
 }
 
@@ -1543,17 +1669,19 @@ fn run() -> Result<()> {
     // IDs that do not pack into 62 bits take a slow per-row fallback on the compact path (a
     // 64-byte copy into an unsized side scatter, or a side-table user): with many of them the
     // compact path is 2-4x slower than the plain 64-byte one, so sample the event files first.
+    // COMPACT_SLOW=1: unpackable IDs ride the compact path as side-table references.
+    let compact_slow = std::env::var("COMPACT_SLOW").as_deref() == Ok("1");
     let compact = category_names.len() <= 256
         && window.1.saturating_sub(window.0) < (1i64 << 32)
         && std::env::var_os("PIPE_LEGACY").is_none()
-        && mostly_packable(&event_maps);
-    let name_from_lines = !compact
+        && (compact_slow || mostly_packable(&event_maps));
+    let name_from_lines = (!compact || compact_slow)
         && match std::env::var("NAME_FROM_LINES").as_deref() {
             Ok("0") => false,
             Ok("1") => true,
             _ => many_long_users(&event_maps),
         };
-    let context = Context { window, products, unknown_category, campaigns, longs: LongIds::default(), compact, name_from_lines };
+    let context = Context { window, products, unknown_category, campaigns, longs: LongIds::default(), compact, name_from_lines, compact_slow };
 
     // A+B. Task 0 resolves links while the other threads parse events (largest chunks
     // first). resolve_people fans its phases out over `threads` workers of its own, so links
@@ -1580,6 +1708,8 @@ fn run() -> Result<()> {
         events: Scatter::new(dedup_parts, if compact { 0 } else { event_cap }),
         events32: BlockScatter::new_paired(dedup_parts), // empty lists cost nothing
         slow_users: Vec::new(),
+        slow_ids: Vec::new(),
+        slow_seqs: Vec::new(),
         thread: next_thread.fetch_add(1, Ordering::Relaxed) as u64,
         clicks: BlockScatter::new(0),
         // Room for twice this thread's share of the click lines (~47 bytes each): reserved,
@@ -1592,6 +1722,8 @@ fn run() -> Result<()> {
         events: Scatter::new(dedup_parts, 0),
         events32: BlockScatter::new_paired(0),
         slow_users: Vec::new(),
+        slow_ids: Vec::new(),
+        slow_seqs: Vec::new(),
         thread: u64::MAX,
         clicks: BlockScatter::new(person_parts),
         early_clicks: Vec::new(),
@@ -1627,12 +1759,16 @@ fn run() -> Result<()> {
         parse_chunk(&context, Some(&people), &event_maps, &click_maps, click_chunks[at], state)
     });
     let mut slow_users: Vec<Vec<Key>> = (0..threads).map(|_| Vec::new()).collect();
+    let mut slow_ids: Vec<Vec<Key>> = (0..threads).map(|_| Vec::new()).collect();
+    let mut slow_seqs: Vec<Vec<u64>> = (0..threads).map(|_| Vec::new()).collect();
     let mut event_parts: Vec<Scatter<EventCopy>> = Vec::new();
     let mut event32_parts: Vec<BlockScatter<EventCopy32>> = Vec::new();
     let mut early_clicks: Vec<Vec<Click>> = Vec::new();
     for state in parsed {
         early_clicks.push(state.early_clicks);
         slow_users[state.thread as usize] = state.slow_users;
+        slow_ids[state.thread as usize] = state.slow_ids;
+        slow_seqs[state.thread as usize] = state.slow_seqs;
         event_parts.push(state.events);
         event32_parts.push(state.events32);
     }
@@ -1688,7 +1824,7 @@ fn run() -> Result<()> {
             }
             let pieces32: Vec<&[EventCopy32]> = event32_parts.iter().flat_map(|scatter| scatter.pieces(p)).filter(|s| !s.is_empty()).collect();
             if !pieces32.is_empty() {
-                dedup32(pieces32, &people, &slow_users, context.window.0, scratch, out);
+                dedup32(pieces32, &people, &slow_users, &slow_ids, &slow_seqs, context.window.0, scratch, out, if context.name_from_lines { Some(&mut *seqs) } else { None });
                 // Partition p's event blocks are dead now (only this task reads them, and its
                 // slices died with dedup32): this thread's survivor blocks reuse them, already
                 // faulted in and likely cached, instead of fresh pages.
