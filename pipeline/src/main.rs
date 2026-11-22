@@ -648,6 +648,7 @@ struct ParseState {
     slow_users: Vec<Key>,           // compact: user keys that do not pack, referenced by EventCopy32.user
     thread: u64,                    // index of this state's thread (for slow_users references)
     clicks: BlockScatter<Click>,    // by person partition
+    early_clicks: Vec<Click>,       // parsed before links: `person` holds the user key until resolved
     dates: ts::DateCache,
 }
 
@@ -734,6 +735,19 @@ fn parse_chunk(
             state.events32.flush();
             crate::scatter::fence(); // the arena is read by other threads in dedup
         }
+        Kind::Click if people.is_none() => {
+            // Parsed beside the events, before links resolve: keep the user key in `person`;
+            // resolve_clicks maps it to the person later (during dedup).
+            for_each_record::<4>(bytes_of(&click_maps[chunk.file]), chunk.start, chunk.end, |fields, _| {
+                let [Some(click_id), Some(user), Some(campaign), Some(ts)] = *fields else { return };
+                let Some(&campaign) = context.campaigns.get(&key_of(campaign, None)) else { return };
+                let Some(ts) = ts::parse_cached(ts, &mut state.dates) else { return };
+                if ts < start_ms || ts >= end_ms {
+                    return;
+                }
+                state.early_clicks.push(Click { person: key_of(user, None), click_id: key_of_deferred_once(click_id, &context.longs), ts, campaign });
+            });
+        }
         Kind::Click => {
             let people = people.expect("clicks are parsed after links");
             let mut pending: Vec<(Key, Click)> = Vec::with_capacity(CLICK_BATCH);
@@ -765,6 +779,23 @@ fn parse_chunk(
     // ones become a batch for LongIds::build after parsing.
     context.longs.flush();
     context.longs.close_unit();
+}
+
+/// Maps early clicks' user keys to persons (each prefetched a few clicks ahead) and scatters
+/// them by person.
+fn resolve_clicks(people: &People, clicks: &[Click], out: &mut BlockScatter<Click>) {
+    const AHEAD: usize = 16;
+    for click in clicks.iter().take(AHEAD) {
+        people.prefetch(click.person);
+    }
+    for (i, click) in clicks.iter().enumerate() {
+        if let Some(next) = clicks.get(i + AHEAD) {
+            people.prefetch(next.person);
+        }
+        let mut click = *click;
+        click.person = people.get(click.person);
+        out.push(person_partition(click.person), click);
+    }
 }
 
 const CLICK_BATCH: usize = 64; // research sweep: 16/32/64/128 -> 0.125/0.118/0.116/0.116 s (mirror, 20M)
@@ -1507,6 +1538,7 @@ fn run() -> Result<()> {
         slow_users: Vec::new(),
         thread: next_thread.fetch_add(1, Ordering::Relaxed) as u64,
         clicks: BlockScatter::new(0),
+        early_clicks: Vec::new(),
         dates: ts::DateCache::default(),
     };
     let new_clicks = || ParseState {
@@ -1515,9 +1547,17 @@ fn run() -> Result<()> {
         slow_users: Vec::new(),
         thread: u64::MAX,
         clicks: BlockScatter::new(person_parts),
+        early_clicks: Vec::new(),
         dates: ts::DateCache::default(),
     };
-    let parsed = run_tasks(threads, event_chunks.len() + 1, new_events, |state, at| {
+    // EARLY_CLICKS (default on): click chunks join the first pass (they need no links);
+    // their persons are resolved during dedup.
+    let early = std::env::var("EARLY_CLICKS").as_deref() != Ok("0");
+    let mut click_chunks = Vec::new();
+    chunks_of(Kind::Click, &click_maps, &mut click_chunks);
+    click_chunks.sort_by_key(|chunk| std::cmp::Reverse(chunk.end - chunk.start));
+    let early_count = if early { click_chunks.len() } else { 0 };
+    let parsed = run_tasks(threads, event_chunks.len() + 1 + early_count, new_events, |state, at| {
         if at == 0 {
             // The link phases run on this task's thread plus one more: the other pool threads are
             // busy parsing, so more link workers would put well over NCPU threads in the
@@ -1528,27 +1568,37 @@ fn run() -> Result<()> {
             // LINK_THREADS overrides (experiments).
             let link_threads = std::env::var("LINK_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0).unwrap_or(3);
             *people_slot.lock().unwrap() = Some(resolve_people(&link_maps, link_threads, &context.longs));
-        } else {
+        } else if at <= event_chunks.len() {
             parse_chunk(&context, None, &event_maps, &click_maps, event_chunks[at - 1], state);
+        } else {
+            parse_chunk(&context, None, &event_maps, &click_maps, click_chunks[at - 1 - event_chunks.len()], state);
         }
     });
     let people = people_slot.into_inner().unwrap().expect("links resolved");
     timer.mark("links || parse events");
-    let mut click_chunks = Vec::new();
-    chunks_of(Kind::Click, &click_maps, &mut click_chunks);
-    click_chunks.sort_by_key(|chunk| std::cmp::Reverse(chunk.end - chunk.start));
-    let clicked = run_tasks(threads, click_chunks.len(), new_clicks, |state, at| {
+    let clicked = run_tasks(threads, if early { 0 } else { click_chunks.len() }, new_clicks, |state, at| {
         parse_chunk(&context, Some(&people), &event_maps, &click_maps, click_chunks[at], state)
     });
     let mut slow_users: Vec<Vec<Key>> = (0..threads).map(|_| Vec::new()).collect();
     let mut event_parts: Vec<Scatter<EventCopy>> = Vec::new();
     let mut event32_parts: Vec<BlockScatter<EventCopy32>> = Vec::new();
+    let mut early_clicks: Vec<Vec<Click>> = Vec::new();
     for state in parsed {
+        early_clicks.push(state.early_clicks);
         slow_users[state.thread as usize] = state.slow_users;
         event_parts.push(state.events);
         event32_parts.push(state.events32);
     }
-    let click_parts: Vec<BlockScatter<Click>> = clicked.into_iter().map(|s| s.clicks).collect();
+    let mut click_parts: Vec<BlockScatter<Click>> = clicked.into_iter().map(|s| s.clicks).collect();
+    const RESOLVE_TASK: usize = 1 << 15;
+    let mut click_tasks: Vec<(usize, usize, usize)> = Vec::new();
+    for (t, clicks) in early_clicks.iter().enumerate() {
+        let mut start = 0;
+        while start < clicks.len() {
+            click_tasks.push((t, start, (start + RESOLVE_TASK).min(clicks.len())));
+            start += RESOLVE_TASK;
+        }
+    }
     // Deferred long IDs (event and click IDs) become readable here, before sessions and output.
     context.longs.build(threads);
     timer.mark("parse clicks");
@@ -1576,9 +1626,14 @@ fn run() -> Result<()> {
     // C. dedup per event_id partition.
     let deduped = run_tasks(
         threads,
-        dedup_parts,
-        || (DedupScratch::default(), BlockScatter::new(person_parts), BlockScatter::<u64>::new(if context.name_from_lines { person_parts } else { 0 })),
-        |(scratch, out, seqs), p| {
+        dedup_parts + click_tasks.len(),
+        || (DedupScratch::default(), BlockScatter::new(person_parts), BlockScatter::<u64>::new(if context.name_from_lines { person_parts } else { 0 }), BlockScatter::<Click>::new(if early { person_parts } else { 0 })),
+        |(scratch, out, seqs, clicks_out), p| {
+            if p >= dedup_parts {
+                let (t, start, end) = click_tasks[p - dedup_parts];
+                resolve_clicks(&people, &early_clicks[t][start..end], clicks_out);
+                return;
+            }
             let pieces32: Vec<&[EventCopy32]> = event32_parts.iter().flat_map(|scatter| scatter.pieces(p)).filter(|s| !s.is_empty()).collect();
             if !pieces32.is_empty() {
                 dedup32(pieces32, &people, &slow_users, context.window.0, scratch, out);
@@ -1596,7 +1651,7 @@ fn run() -> Result<()> {
             }
         },
     );
-    let (person_events, person_seqs): (Vec<BlockScatter<Event>>, Vec<BlockScatter<u64>>) = deduped.into_iter().map(|(_, out, seqs)| (out, seqs)).unzip();
+    let (person_events, person_seqs): (Vec<BlockScatter<Event>>, Vec<BlockScatter<u64>>) = deduped.into_iter().map(|(_, out, seqs, clicks_out)| { if early { click_parts.push(clicks_out); } (out, seqs) }).unzip();
     timer.mark("dedup");
     if TIE_CONFLICT.load(Ordering::Relaxed) {
         // Nothing has been written yet: start over on the exact path (same args, same env).
