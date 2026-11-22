@@ -1075,6 +1075,9 @@ pub struct CampaignCounts {
 /// `organic` is the index after the last campaign.
 struct CampaignCounters {
     dense: Vec<CampaignCounts>,
+    /// Dense mode: assisted counts day-major ([day][campaign]), apart from the rows: a session
+    /// adds one to each of ~10 active campaigns on one day, so they stay in one L1-sized row.
+    assisted: Vec<u64>,
     first_day: i64,
     days: usize,
     organic: u32,
@@ -1087,7 +1090,19 @@ impl CampaignCounters {
         let days = ((window.1 - 1).div_euclid(DAY_MS) - first_day + 1).max(1) as usize;
         let cells = (campaigns + 1).saturating_mul(days);
         let dense = if cells <= 8 << 20 { vec![CampaignCounts::default(); cells] } else { Vec::new() };
-        Self { dense, first_day, days, organic: campaigns as u32, sparse: FxHashMap::default() }
+        let assisted = if dense.is_empty() { Vec::new() } else { vec![0; cells] };
+        Self { dense, assisted, first_day, days, organic: campaigns as u32, sparse: FxHashMap::default() }
+    }
+
+    /// Dense mode with `day` inside the window: that day's assisted counters, by campaign.
+    #[inline(always)]
+    fn assist_row(&mut self, day: i32) -> Option<&mut [u64]> {
+        let offset = i64::from(day) - self.first_day;
+        if self.assisted.is_empty() || !(0..self.days as i64).contains(&offset) {
+            return None;
+        }
+        let width = self.organic as usize + 1;
+        Some(&mut self.assisted[offset as usize * width..(offset as usize + 1) * width])
     }
 
     #[inline(always)]
@@ -1110,13 +1125,17 @@ impl CampaignCounters {
             row.revenue += c.revenue;
             row.assisted += c.assisted;
         };
+        let width = self.organic as usize + 1;
         for (cell, counts) in self.dense.iter().enumerate() {
+            let (index, offset) = (cell / self.days, cell % self.days);
+            let mut counts = *counts;
+            counts.assisted += self.assisted[offset * width + index];
             if counts.sessions == 0 && counts.assisted == 0 {
                 continue; // never credited nor assisted: no row
             }
-            let (index, offset) = ((cell / self.days) as u32, (cell % self.days) as i64);
+            let index = index as u32;
             let campaign = if index == self.organic { ORGANIC } else { index };
-            add(total, (campaign, (self.first_day + offset) as i32), counts);
+            add(total, (campaign, (self.first_day + offset as i64) as i32), &counts);
         }
         for (key, counts) in &self.sparse {
             add(total, *key, counts);
@@ -1232,8 +1251,17 @@ fn person_sessions<T: TsOffset>(person: Key, ts_rel: &[T], purchases: &[Purchase
                 first_latest -= 1;
             }
             // Clicks step 7: every campaign among the same clicks assists once.
-            for &campaign in &state.active {
-                state.campaign_daily.at(campaign, day).assisted += 1;
+            match state.campaign_daily.assist_row(day) {
+                Some(row) => {
+                    for &campaign in &state.active {
+                        row[campaign as usize] += 1;
+                    }
+                }
+                None => {
+                    for &campaign in &state.active {
+                        state.campaign_daily.at(campaign, day).assisted += 1;
+                    }
+                }
             }
             clicks[first_latest].campaign
         } else {
