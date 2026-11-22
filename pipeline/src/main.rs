@@ -1164,6 +1164,7 @@ struct PeopleState {
     scratch: GroupScratch<u32>,
     scratch_wide: GroupScratch<i64>,
     user_rows: Vec<UserRow>,
+    spare_categories: Vec<(u32, u64)>,
     campaign_daily: CampaignCounters,
     session_number: u64,
 }
@@ -1176,8 +1177,8 @@ struct DayAccumulator {
     by_category: Vec<(u32, u64)>,
 }
 
-fn flush(person: Key, acc: &mut Option<DayAccumulator>, rows: &mut Vec<UserRow>, category_names: &[Vec<u8>]) {
-    if let Some(day) = acc.take() {
+fn flush(person: Key, acc: &mut Option<DayAccumulator>, rows: &mut Vec<UserRow>, category_names: &[Vec<u8>], spare: &mut Vec<(u32, u64)>) {
+    if let Some(mut day) = acc.take() {
         // Highest summed purchase price; a tie goes to the byte-wise smallest name.
         let top_category = day
             .by_category
@@ -1185,6 +1186,9 @@ fn flush(person: Key, acc: &mut Option<DayAccumulator>, rows: &mut Vec<UserRow>,
             .max_by(|a, b| a.1.cmp(&b.1).then_with(|| category_names[b.0 as usize].cmp(&category_names[a.0 as usize])))
             .map(|&(category, _)| category);
         rows.push(UserRow { person, day: day.day, sessions: day.sessions, events: day.events, revenue: day.revenue, top_category });
+        // The category list goes back for the next day (no allocation per purchasing day).
+        day.by_category.clear();
+        *spare = std::mem::take(&mut day.by_category);
     }
 }
 
@@ -1221,9 +1225,9 @@ fn person_sessions<T: TsOffset>(person: Key, ts_rel: &[T], purchases: &[Purchase
         let purchased = !session_purchases.is_empty();
 
         if day_acc.as_ref().is_some_and(|acc| acc.day != day) {
-            flush(person, &mut day_acc, &mut state.user_rows, category_names);
+            flush(person, &mut day_acc, &mut state.user_rows, category_names, &mut state.spare_categories);
         }
-        let acc = day_acc.get_or_insert_with(|| DayAccumulator { day, sessions: 0, events: 0, revenue: 0, by_category: Vec::new() });
+        let acc = day_acc.get_or_insert_with(|| DayAccumulator { day, sessions: 0, events: 0, revenue: 0, by_category: std::mem::take(&mut state.spare_categories) });
         acc.sessions += 1;
         acc.events += session_len as u64;
         acc.revenue += revenue;
@@ -1295,7 +1299,7 @@ fn person_sessions<T: TsOffset>(person: Key, ts_rel: &[T], purchases: &[Purchase
         row.purchasing += u64::from(purchased);
         row.revenue += revenue;
     }
-    flush(person, &mut day_acc, &mut state.user_rows, category_names);
+    flush(person, &mut day_acc, &mut state.user_rows, category_names, &mut state.spare_categories);
     // Reset the window for the next person.
     for &campaign in &state.active {
         state.win_count[campaign as usize] = 0;
@@ -1826,6 +1830,7 @@ fn run() -> Result<()> {
             scratch: GroupScratch::default(),
             scratch_wide: GroupScratch::default(),
             user_rows: Vec::new(),
+            spare_categories: Vec::new(),
             campaign_daily: CampaignCounters::new(campaign_count, context.window),
             session_number: 0,
             win_count: vec![0; campaign_count],
