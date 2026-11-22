@@ -201,6 +201,9 @@ fn mostly_packable(maps: &[Option<Mmap>]) -> bool {
     unpackable * 50 <= rows
 }
 
+/// No event line (names from lines: a packed user, named by its key).
+const NOSEQ: u64 = u64::MAX;
+
 /// A long-ID copy's `ingest` field: bits 0..34 its ingest_ts as ms after window_start - 2^33
 /// (2^34 - 1 for NEVER), bits 34..40 the parsing thread, bits 40..64 the index of its full key
 /// in that thread's side table. Out of range: TIE_CONFLICT reruns on the 64-byte path.
@@ -673,6 +676,7 @@ struct ParseState {
     events32: BlockScatter<EventCopy32>, // compact: packed event_ids, by partition of the packed id
     slow_users: Vec<Key>,           // compact: user keys that do not pack, referenced by EventCopy32.user
     slow_ids: Vec<Key>,             // compact_slow: event_id keys that do not pack, referenced by EventCopy32.id
+    slow_seqs: Vec<u64>,            // compact + name_from_lines: each slow user's event line, in step with slow_users
     thread: u64,                    // index of this state's thread (for slow_users references)
     clicks: BlockScatter<Click>,    // by person partition
     dates: ts::DateCache,
@@ -752,7 +756,13 @@ fn parse_chunk(
                         let copy = match judge(context, fields, ingest, &mut state.dates) {
                             Some((user, ts, price, category)) => {
                                 let user = compact::pack62(user).unwrap_or_else(|| {
-                                    state.slow_users.push(key_of_deferred(user, &context.longs));
+                                    if context.name_from_lines {
+                                        // Named later from this line (see Names), not recorded here.
+                                        state.slow_users.push(key_of(user, None));
+                                        state.slow_seqs.push(file_seq | offset as u64);
+                                    } else {
+                                        state.slow_users.push(key_of_deferred(user, &context.longs));
+                                    }
                                     compact::SLOW_USER | state.thread << 40 | (state.slow_users.len() as u64 - 1)
                                 });
                                 EventCopy32 { id, user, ingest: ingest_field, ts: (ts - window_start) as u32, price_cat: price << 8 | category }
@@ -922,7 +932,8 @@ static TIE_CONFLICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 
 /// `dedup` for packed copies (EventCopy32). Same table and passes; an equal-ingest tie keeps
 /// the copy already held (rules.md: copies with equal ingest_ts are identical).
-fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>], slow_ids: &[Vec<Key>], window_start: i64, scratch: &mut DedupScratch, out: &mut BlockScatter<Event>) {
+#[allow(clippy::too_many_arguments)]
+fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>], slow_ids: &[Vec<Key>], slow_seqs: &[Vec<u64>], window_start: i64, scratch: &mut DedupScratch, out: &mut BlockScatter<Event>, mut seqs: Option<&mut BlockScatter<u64>>) {
     let total: usize = pieces.iter().map(|piece| piece.len()).sum();
     assert!(total < u32::MAX as usize, "dedup partition over 4G copies");
     let starts: Vec<usize> = pieces.iter().scan(0, |at, piece| { let start = *at; *at += piece.len(); Some(start) }).collect();
@@ -1027,6 +1038,19 @@ fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>]
         }
     };
     let n = survivors32.len();
+    // Names from lines: each survivor's line (a slow user's; NOSEQ for a packed one, whose
+    // key holds its bytes), taken before the raw fields are replaced by keys.
+    let lines: Vec<u64> = if seqs.is_some() {
+        survivors32
+            .iter()
+            .map(|&(raw, _, _)| {
+                let user = raw as u64;
+                if user & compact::SLOW_USER != 0 { slow_seqs[((user >> 40) & 0x7F_FFFF) as usize][(user & 0xFF_FFFF_FFFF) as usize] } else { NOSEQ }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     for at in 0..(2 * AHEAD).min(n) {
         side_prefetch(survivors32[at].0);
     }
@@ -1050,6 +1074,9 @@ fn dedup32(pieces: Vec<&[EventCopy32]>, people: &People, slow_users: &[Vec<Key>]
             person_partition(person),
             Event { person, ts: window_start + i64::from(ts), price: price_cat >> 8, category: price_cat & 0xFF },
         );
+        if let Some(seqs) = seqs.as_deref_mut() {
+            seqs.push(person_partition(person), lines[at]);
+        }
     }
 }
 
@@ -1380,7 +1407,7 @@ fn people_partition<T: TsOffset>(
                 group_keys.push(event.person);
                 // A person with a long ID that no link names is named by this event's own
                 // user_id (an unlinked person's events all carry that one ID): read it once.
-                if let Some(seq) = seq {
+                if let Some(seq) = seq.filter(|&&seq| seq != NOSEQ) {
                     if crate::key::is_long(event.person) && longs.slice(event.person).is_empty() {
                         match names.user_at(*seq) {
                             Some(id) if key_of(id, None) == event.person => longs.defer_name(event.person, id),
@@ -1563,7 +1590,7 @@ fn run() -> Result<()> {
         && window.1.saturating_sub(window.0) < (1i64 << 32)
         && std::env::var_os("PIPE_LEGACY").is_none()
         && (compact_slow || mostly_packable(&event_maps));
-    let name_from_lines = !compact
+    let name_from_lines = (!compact || compact_slow)
         && match std::env::var("NAME_FROM_LINES").as_deref() {
             Ok("0") => false,
             Ok("1") => true,
@@ -1596,6 +1623,7 @@ fn run() -> Result<()> {
         events32: BlockScatter::new_paired(dedup_parts), // empty lists cost nothing
         slow_users: Vec::new(),
         slow_ids: Vec::new(),
+        slow_seqs: Vec::new(),
         thread: next_thread.fetch_add(1, Ordering::Relaxed) as u64,
         clicks: BlockScatter::new(0),
         dates: ts::DateCache::default(),
@@ -1605,6 +1633,7 @@ fn run() -> Result<()> {
         events32: BlockScatter::new_paired(0),
         slow_users: Vec::new(),
         slow_ids: Vec::new(),
+        slow_seqs: Vec::new(),
         thread: u64::MAX,
         clicks: BlockScatter::new(person_parts),
         dates: ts::DateCache::default(),
@@ -1634,11 +1663,13 @@ fn run() -> Result<()> {
     });
     let mut slow_users: Vec<Vec<Key>> = (0..threads).map(|_| Vec::new()).collect();
     let mut slow_ids: Vec<Vec<Key>> = (0..threads).map(|_| Vec::new()).collect();
+    let mut slow_seqs: Vec<Vec<u64>> = (0..threads).map(|_| Vec::new()).collect();
     let mut event_parts: Vec<Scatter<EventCopy>> = Vec::new();
     let mut event32_parts: Vec<BlockScatter<EventCopy32>> = Vec::new();
     for state in parsed {
         slow_users[state.thread as usize] = state.slow_users;
         slow_ids[state.thread as usize] = state.slow_ids;
+        slow_seqs[state.thread as usize] = state.slow_seqs;
         event_parts.push(state.events);
         event32_parts.push(state.events32);
     }
@@ -1675,7 +1706,7 @@ fn run() -> Result<()> {
         |(scratch, out, seqs), p| {
             let pieces32: Vec<&[EventCopy32]> = event32_parts.iter().flat_map(|scatter| scatter.pieces(p)).filter(|s| !s.is_empty()).collect();
             if !pieces32.is_empty() {
-                dedup32(pieces32, &people, &slow_users, &slow_ids, context.window.0, scratch, out);
+                dedup32(pieces32, &people, &slow_users, &slow_ids, &slow_seqs, context.window.0, scratch, out, if context.name_from_lines { Some(&mut *seqs) } else { None });
                 // Partition p's event blocks are dead now (only this task reads them, and its
                 // slices died with dedup32): this thread's survivor blocks reuse them, already
                 // faulted in and likely cached, instead of fresh pages.
