@@ -213,6 +213,12 @@ impl<T: Copy> BlockScatter<T> {
     /// # Safety
     /// Nothing may read this partition afterwards (its slices must be dead), and only one
     /// caller may recycle a given partition.
+    pub unsafe fn donate(&mut self, start: usize, end: usize) {
+        self.arena.free.push((start, end));
+    }
+
+    /// # Safety
+    /// As for `recycle_partition`: [start, end) must stay alive and unused by anyone else.
     pub unsafe fn recycle_partition<U: Copy>(&self, part: usize, to: &mut BlockScatter<U>) {
         let bytes = BLOCK * std::mem::size_of::<T>();
         for &p in &self.lists[part] {

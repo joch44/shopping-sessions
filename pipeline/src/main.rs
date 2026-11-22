@@ -1666,6 +1666,8 @@ fn run() -> Result<()> {
     }
     let event_maps_ref: &[Option<Mmap>] = event_maps.as_deref().unwrap_or(&[]);
 
+    // RECYCLE_EVENTS=0: survivor blocks come from fresh memory instead of the dead copies.
+    let recycle_events = std::env::var("RECYCLE_EVENTS").as_deref() != Ok("0");
     // C. dedup per event_id partition.
     let deduped = run_tasks(
         threads,
@@ -1690,7 +1692,17 @@ fn run() -> Result<()> {
             }
             let pieces: Vec<&[EventCopy]> = event_parts.iter().flat_map(|scatter| scatter.pieces(p)).filter(|s| !s.is_empty()).collect();
             if !pieces.is_empty() {
-                dedup(pieces, &people, scratch, out, if context.name_from_lines { Some(seqs) } else { None })
+                dedup(pieces, &people, scratch, out, if context.name_from_lines { Some(seqs) } else { None });
+                // Partition p's copies are dead now (only this task reads them): their slots,
+                // already faulted in and likely cached, take this thread's survivor blocks instead
+                // of fresh pages (event_parts outlives every scatter that uses them).
+                if recycle_events {
+                    for scatter in &event_parts {
+                        let (start, end) = scatter.region(p);
+                        // SAFETY: as above; partition p of each scatter is recycled by this task only.
+                        unsafe { out.donate(start, end) };
+                    }
+                }
             }
         },
     );

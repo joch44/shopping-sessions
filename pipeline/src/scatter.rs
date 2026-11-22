@@ -136,6 +136,12 @@ impl<T: Copy> Scatter<T> {
     }
 
     /// The partition's items: its region, then its overflow.
+    /// The partition's whole slot range in the arena, as byte addresses (written or not).
+    pub fn region(&self, part: usize) -> (usize, usize) {
+        let start = self.data.as_ptr().wrapping_add(part * self.cap) as usize;
+        (start, start + self.cap * std::mem::size_of::<T>())
+    }
+
     pub fn pieces(&self, part: usize) -> [&[T]; 2] {
         let start = part * self.cap;
         let region = &self.data[start..start + self.lens[part]];
